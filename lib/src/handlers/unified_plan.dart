@@ -191,7 +191,7 @@ class UnifiedPlan extends HandlerInterface {
       mid: localId,
       kind: options.kind,
       offerRtpParameters: options.rtpParameters,
-      streamId: options.rtpParameters.rtcp!.cname,
+      streamId: options.rtpParameters.rtcp?.cname ?? '',
       trackId: options.trackId,
     );
 
@@ -249,9 +249,8 @@ class UnifiedPlan extends HandlerInterface {
     // Store in the map.
     _mapMidTransceiver[localId] = transceiver;
 
-    final MediaStream? stream = _pc!
-        .getRemoteStreams()
-        .firstWhereOrNull((e) => e?.id == options.rtpParameters.rtcp!.cname);
+    final MediaStream? stream = _pc!.getRemoteStreams().firstWhereOrNull(
+        (e) => e?.id == (options.rtpParameters.rtcp?.cname ?? ''));
 
     if (stream == null) {
       throw ('Stream not found');
@@ -567,6 +566,8 @@ class UnifiedPlan extends HandlerInterface {
       UnifiedPlanUtils.addLegacySimulcast(
         offerMediaObject,
         layers.spatialLayers,
+        options.stream.id ?? 'default-stream',
+        options.track.id ?? 'default-track',
       );
 
       offer =

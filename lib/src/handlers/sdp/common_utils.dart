@@ -170,6 +170,25 @@ class CommonUtils {
     return ssrcCnameLine.value;
   }
 
+  // Updated matchCodecs (if not present, add to src/handlers/sdp/common_utils.dart or ensure it's there)
+  List<RtpCodecCapability> matchCodecs(
+    List<RtpCodecCapability> aCodecs,
+    RtpCodecCapability bCodec, {
+    bool matchPayloadType = true,
+  }) {
+    List<RtpCodecCapability> matchedCodecs = [];
+    for (RtpCodecCapability aCodec in aCodecs) {
+      if (aCodec.mimeType.toLowerCase() == bCodec.mimeType.toLowerCase() &&
+          aCodec.clockRate == bCodec.clockRate &&
+          (matchPayloadType
+              ? (aCodec.preferredPayloadType == bCodec.preferredPayloadType)
+              : true)) {
+        matchedCodecs.add(aCodec);
+      }
+    }
+    return matchedCodecs;
+  }
+
   /// Apply codec parameters in the given SDP m= section answer based on the
   /// given RTP parameters of an offer.
   static void applyCodecParameters(
