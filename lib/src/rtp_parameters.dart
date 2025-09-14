@@ -321,7 +321,16 @@ class RtxSsrc {
 
   RtxSsrc(this.ssrc);
 
-  RtxSsrc.fromMap(Map data) : ssrc = data['ssrc'];
+  RtxSsrc.fromMap(Map data) : ssrc = _parseToInt(data['ssrc']);
+
+  // Add this helper method to the RtxSsrc class
+  static int? _parseToInt(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is String) return int.tryParse(value);
+    if (value is double) return value.toInt();
+    return null; // Fallback to null if invalid
+  }
 
   Map<String, dynamic> toMap() {
     return {
@@ -435,7 +444,7 @@ class RtpEncodingParameters extends RTCRtpEncoding {
 
   static RtpEncodingParameters fromMap(Map data) {
     return RtpEncodingParameters(
-      codecPayloadType: data['codecPayloadType'],
+      codecPayloadType: _parseToInt(data['codecPayloadType']),
       rtx: data['rtx'] != null ? RtxSsrc.fromMap(data['rtx']) : null,
       dtx: data['dtx'],
       scalabilityMode: data['scalabilityMode'],
@@ -447,14 +456,23 @@ class RtpEncodingParameters extends RTCRtpEncoding {
           ? PriorityExtension.fromString(data['networkPriority'])
           : null,
       active: data['active'] ?? true,
-      maxBitrate: data['maxBitrate'],
-      maxFramerate: data['maxFramerate'],
-      minBitrate: data['minBitrate'],
-      numTemporalLayers: data['numTemporalLayers'],
+      maxBitrate: _parseToInt(data['maxBitrate']),
+      maxFramerate: _parseToInt(data['maxFramerate']),
+      minBitrate: _parseToInt(data['minBitrate']),
+      numTemporalLayers: _parseToInt(data['numTemporalLayers']),
       rid: data['rid'],
       scaleResolutionDownBy: data['scaleResolutionDownBy'],
-      ssrc: data['ssrc'],
+      ssrc: _parseToInt(data['ssrc']),
     );
+  }
+
+// Add this helper method to the RtpEncodingParameters class
+  static int? _parseToInt(dynamic value) {
+    if (value == null) return null;
+    if (value is int) return value;
+    if (value is String) return int.tryParse(value);
+    if (value is double) return value.toInt();
+    return null; // Fallback to null if invalid
   }
 
   Map<String, dynamic> toMap() {
@@ -726,7 +744,10 @@ class RtpParameters {
         encodings = List<RtpEncodingParameters>.from(data['encodings']
             .map((encoding) => RtpEncodingParameters.fromMap(encoding))
             .toList()),
-        rtcp = RtcpParameters.fromMap(data['rtcp']);
+        rtcp = RtcpParameters.fromMap(data['rtcp']) {
+    print('DEBUG: RtpParameters.fromMap: mid=$mid, codecs=${codecs.length}, headerExtensions=${headerExtensions.length}, encodings=${encodings.length}');
+    print('DEBUG: RtpParameters.fromMap: encodings=${encodings.map((e) => 'ssrc=${e.ssrc}${e.rtx != null ? ', rtx=${e.rtx!.ssrc}' : ''}').join('; ')}');
+  }
 
   static RtpParameters copy(
     RtpParameters old, {

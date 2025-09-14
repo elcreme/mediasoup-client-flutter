@@ -1,4 +1,9 @@
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'dart:async';
+import 'dart:collection';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:js_util' as js_util;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:sdp_transform/sdp_transform.dart';
 import 'package:mediasoup_client_flutter/src/ortc.dart';
@@ -492,179 +497,167 @@ class UnifiedPlan extends HandlerInterface {
   }
 
   @override
-  Future<HandlerSendResult> send(HandlerSendOptions options) async {
-    _assertSendRirection();
+Future<HandlerSendResult> send(HandlerSendOptions options) async {
+  _assertSendRirection();
 
-    _logger.debug(
-        'send() [kind:${options.track.kind}, track.id:${options.track.id}');
+  _logger.debug('send() [kind:${options.track.kind}, track.id:${options.track.id}]');
 
-    if (options.encodings.length > 1) {
-      int idx = 0;
-      options.encodings.forEach((RtpEncodingParameters encoding) {
-        encoding.rid = 'r${idx++}';
-      });
-    }
+  // Ensure encodings have RIDs for simulcast
+  if (options.encodings.length > 1) {
+    int idx = 0;
+    options.encodings.forEach((RtpEncodingParameters encoding) {
+      encoding.rid = 'r${idx++}';
+    });
+  }
 
-    RtpParameters sendingRtpParameters = RtpParameters.copy(
-        _sendingRtpParametersByKind[
-            RTCRtpMediaTypeExtension.fromString(options.track.kind!)]!);
+  // Copy RTP parameters
+  RtpParameters sendingRtpParameters = RtpParameters.copy(
+    _sendingRtpParametersByKind[RTCRtpMediaTypeExtension.fromString(options.track.kind!)]!,
+  );
 
-    // This may throw.
-    sendingRtpParameters.codecs =
-        Ortc.reduceCodecs(sendingRtpParameters.codecs, options.codec);
+  // Reduce codecs if specified
+  if (options.codec != null) {
+    sendingRtpParameters.codecs = Ortc.reduceCodecs(sendingRtpParameters.codecs, options.codec);
+  }
 
-    RtpParameters sendingRemoteRtpParameters = RtpParameters.copy(
-        _sendingRemoteRtpParametersByKind[
-            RTCRtpMediaTypeExtension.fromString(options.track.kind!)]!);
+  RtpParameters sendingRemoteRtpParameters = RtpParameters.copy(
+    _sendingRemoteRtpParametersByKind[RTCRtpMediaTypeExtension.fromString(options.track.kind!)]!,
+  );
 
-    // This may throw.
-    sendingRemoteRtpParameters.codecs =
-        Ortc.reduceCodecs(sendingRemoteRtpParameters.codecs, options.codec);
+  if (options.codec != null) {
+    sendingRemoteRtpParameters.codecs = Ortc.reduceCodecs(sendingRemoteRtpParameters.codecs, options.codec);
+  }
 
-    MediaSectionIdx mediaSectionIdx = _remoteSdp.getNextMediaSectionIdx();
+  MediaSectionIdx mediaSectionIdx = _remoteSdp.getNextMediaSectionIdx();
 
-    RTCRtpTransceiver transceiver = await _pc!.addTransceiver(
-      track: options.track,
-      kind: RTCRtpMediaTypeExtension.fromString(options.track.kind!),
-      init: RTCRtpTransceiverInit(
-        direction: TransceiverDirection.SendOnly,
-        streams: [options.stream],
-        sendEncodings: options.encodings,
-      ),
-    );
+  // Add transceiver
+  RTCRtpTransceiver transceiver = await _pc!.addTransceiver(
+    track: options.track,
+    kind: RTCRtpMediaTypeExtension.fromString(options.track.kind!),
+    init: RTCRtpTransceiverInit(
+      direction: TransceiverDirection.SendOnly,
+      streams: [options.stream],
+      sendEncodings: options.encodings,
+    ),
+  );
 
-    RTCSessionDescription offer = await _pc!.createOffer({});
-    SdpObject localSdpObject = SdpObject.fromMap(parse(offer.sdp!));
-    MediaObject offerMediaObject;
+  // Create offer (no invalid options like voiceActivityDetection)
+  RTCSessionDescription offer = await _pc!.createOffer({});
+  if (offer.sdp == null) throw Exception('Offer SDP is null'); // Guard
 
-    if (!_transportReady) {
-      await _setupTransport(
-        localDtlsRole: DtlsRole.server,
-        localSdpObject: localSdpObject,
-      );
-    }
+  SdpObject localSdpObject = SdpObject.fromMap(parse(offer.sdp!));
+  MediaObject offerMediaObject;
 
-    // Speacial case for VP9 with SVC.
-    bool hackVp9Svc = false;
-
-    ScalabilityMode layers = ScalabilityMode.parse((options.encodings.isNotEmpty
-            ? options.encodings
-            : [RtpEncodingParameters(scalabilityMode: '')])
-        .first
-        .scalabilityMode!);
-
-    if (options.encodings.length == 1 &&
-        layers.spatialLayers > 1 &&
-        sendingRtpParameters.codecs.first.mimeType.toLowerCase() ==
-            'video/vp9') {
-      _logger.debug('send() | enabling legacy simulcast for VP9 SVC');
-
-      hackVp9Svc = true;
-      localSdpObject = SdpObject.fromMap(parse(offer.sdp!));
-      offerMediaObject = localSdpObject.media[mediaSectionIdx.idx];
-
-      UnifiedPlanUtils.addLegacySimulcast(
-        offerMediaObject,
-        layers.spatialLayers,
-        options.stream.id ?? 'default-stream',
-        options.track.id ?? 'default-track',
-      );
-
-      offer =
-          RTCSessionDescription(write(localSdpObject.toMap(), null), 'offer');
-    }
-
-    _logger.debug(
-        'send() | calling pc.setLocalDescription() [offer:${offer.toMap()}');
-
-    await _pc!.setLocalDescription(offer);
-
-    if (!kIsWeb) {
-      final transceivers = await _pc!.getTransceivers();
-      transceiver = transceivers.firstWhere(
-        (_transceiver) =>
-            _transceiver.sender.track?.id == options.track.id &&
-            _transceiver.sender.track?.kind == options.track.kind,
-        orElse: () => throw 'No transceiver found',
-      );
-    }
-
-    // We can now get the transceiver.mid.
-    String localId = transceiver.mid;
-
-    // Set MID.
-    sendingRtpParameters.mid = localId;
-
-    localSdpObject =
-        SdpObject.fromMap(parse((await _pc!.getLocalDescription())!.sdp!));
-    offerMediaObject = localSdpObject.media[mediaSectionIdx.idx];
-
-    // Set RTCP CNAME.
-    sendingRtpParameters.rtcp!.cname = CommonUtils.getCname(offerMediaObject);
-
-    // Set RTP encdoings by parsing the SDP offer if no encoding are given.
-    if (options.encodings.isEmpty) {
-      sendingRtpParameters.encodings =
-          UnifiedPlanUtils.getRtpEncodings(offerMediaObject);
-    }
-    // Set RTP encodings by parsing the SDP offer and complete them with given
-    // one if just a single encoding has been given.
-    else if (options.encodings.length == 1) {
-      List<RtpEncodingParameters> newEncodings =
-          UnifiedPlanUtils.getRtpEncodings(offerMediaObject);
-
-      newEncodings[0] =
-          RtpEncodingParameters.assign(newEncodings[0], options.encodings[0]);
-
-      // Hack for VP9 SVC.
-      if (hackVp9Svc) {
-        newEncodings = [newEncodings[0]];
-      }
-
-      sendingRtpParameters.encodings = newEncodings;
-    }
-    // Otherwise if more than 1 encoding are given use them verbatim.
-    else {
-      sendingRtpParameters.encodings = options.encodings;
-    }
-
-    // If VP8 or H264 and there is effective simulcast, add scalabilityMode to
-    // each encoding.
-    if (sendingRtpParameters.encodings.length > 1 &&
-        (sendingRtpParameters.codecs[0].mimeType.toLowerCase() == 'video/vp8' ||
-            sendingRtpParameters.codecs[0].mimeType.toLowerCase() ==
-                'video/h264')) {
-      for (RtpEncodingParameters encoding in sendingRtpParameters.encodings) {
-        encoding.scalabilityMode = 'S1T3';
-      }
-    }
-
-    _remoteSdp.send(
-      offerMediaObject: offerMediaObject,
-      reuseMid: mediaSectionIdx.reuseMid,
-      offerRtpParameters: sendingRtpParameters,
-      answerRtpParameters: sendingRemoteRtpParameters,
-      codecOptions: options.codecOptions,
-      extmapAllowMixed: true,
-    );
-
-    RTCSessionDescription answer =
-        RTCSessionDescription(_remoteSdp.getSdp(), 'answer');
-
-    _logger.debug(
-        'send() | calling pc.setRemoteDescription() [answer:${answer.toMap()}]');
-
-    await _pc!.setRemoteDescription(answer);
-
-    // Store in the map.
-    _mapMidTransceiver[localId] = transceiver;
-
-    return HandlerSendResult(
-      localId: localId,
-      rtpParameters: sendingRtpParameters,
-      rtpSender: transceiver.sender,
+  if (!_transportReady) {
+    await _setupTransport(
+      localDtlsRole: DtlsRole.server,
+      localSdpObject: localSdpObject,
     );
   }
+
+  // Handle VP9 SVC simulcast
+  bool hackVp9Svc = false;
+  ScalabilityMode layers = ScalabilityMode.parse(
+    (options.encodings.isNotEmpty ? options.encodings : [RtpEncodingParameters(scalabilityMode: '')])
+        .first
+        .scalabilityMode ?? '',
+  );
+
+  if (options.encodings.length == 1 &&
+      layers.spatialLayers > 1 &&
+      sendingRtpParameters.codecs.first.mimeType.toLowerCase() == 'video/vp9') {
+    _logger.debug('send() | enabling legacy simulcast for VP9 SVC');
+    hackVp9Svc = true;
+    localSdpObject = SdpObject.fromMap(parse(offer.sdp!));
+    offerMediaObject = localSdpObject.media[mediaSectionIdx.idx];
+
+    UnifiedPlanUtils.addLegacySimulcast(
+      offerMediaObject,
+      layers.spatialLayers,
+      options.stream.id ?? 'default-stream-${math.Random().nextInt(1000000)}',
+      options.track.id ?? 'default-track-${math.Random().nextInt(1000000)}',
+    );
+
+    offer = RTCSessionDescription(write(localSdpObject.toMap(), null), 'offer');
+  } else {
+    offerMediaObject = localSdpObject.media[mediaSectionIdx.idx];
+  }
+
+  _logger.debug('send() | calling pc.setLocalDescription() [offer:${offer.toMap()}]');
+  await _pc!.setLocalDescription(offer);
+
+  // Re-fetch transceiver on non-web platforms
+  if (!kIsWeb) {
+    final transceivers = await _pc!.getTransceivers();
+    transceiver = transceivers.firstWhere(
+      (_transceiver) =>
+          _transceiver.sender.track?.id == options.track.id &&
+          _transceiver.sender.track?.kind == options.track.kind,
+      orElse: () => throw Exception('No transceiver found'),
+    );
+  }
+
+  // Get MID
+  String? localId = transceiver.mid;
+  if (localId == null) throw Exception('Transceiver MID is null');
+
+  // Set MID
+  sendingRtpParameters.mid = localId;
+
+  // Re-fetch SDP
+  localSdpObject = SdpObject.fromMap(parse((await _pc!.getLocalDescription())!.sdp!));
+  offerMediaObject = localSdpObject.media[mediaSectionIdx.idx];
+
+  // Set RTCP CNAME
+  sendingRtpParameters.rtcp ??= RtcpParameters();
+  sendingRtpParameters.rtcp!.cname = CommonUtils.getCname(offerMediaObject);
+
+  // Set encodings
+  if (options.encodings.isEmpty) {
+    sendingRtpParameters.encodings = UnifiedPlanUtils.getRtpEncodings(offerMediaObject);
+  } else if (options.encodings.length == 1) {
+    List<RtpEncodingParameters> newEncodings = UnifiedPlanUtils.getRtpEncodings(offerMediaObject);
+    newEncodings[0] = RtpEncodingParameters.assign(newEncodings[0], options.encodings[0]);
+    if (hackVp9Svc) {
+      newEncodings = [newEncodings[0]];
+    }
+    sendingRtpParameters.encodings = newEncodings;
+  } else {
+    sendingRtpParameters.encodings = options.encodings;
+  }
+
+  // Add scalabilityMode for VP8/H264 simulcast
+  if (sendingRtpParameters.encodings.length > 1 &&
+      (sendingRtpParameters.codecs[0].mimeType.toLowerCase() == 'video/vp8' ||
+          sendingRtpParameters.codecs[0].mimeType.toLowerCase() == 'video/h264')) {
+    for (RtpEncodingParameters encoding in sendingRtpParameters.encodings) {
+      encoding.scalabilityMode = 'S1T3';
+    }
+  }
+
+  // Update remote SDP
+  _remoteSdp.send(
+    offerMediaObject: offerMediaObject,
+    reuseMid: mediaSectionIdx.reuseMid,
+    offerRtpParameters: sendingRtpParameters,
+    answerRtpParameters: sendingRemoteRtpParameters,
+    codecOptions: options.codecOptions,
+    extmapAllowMixed: true,
+  );
+
+  RTCSessionDescription answer = RTCSessionDescription(_remoteSdp.getSdp(), 'answer');
+  _logger.debug('send() | calling pc.setRemoteDescription() [answer:${answer.toMap()}]');
+  await _pc!.setRemoteDescription(answer);
+
+  // Store transceiver
+  _mapMidTransceiver[localId] = transceiver;
+
+  return HandlerSendResult(
+    localId: localId,
+    rtpParameters: sendingRtpParameters,
+    rtpSender: transceiver.sender,
+  );
+}
 
   @override
   Future<HandlerSendDataChannelResult> sendDataChannel(

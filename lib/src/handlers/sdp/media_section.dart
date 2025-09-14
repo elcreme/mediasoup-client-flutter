@@ -5,6 +5,18 @@ import 'package:mediasoup_client_flutter/src/transport.dart';
 import 'package:mediasoup_client_flutter/src/rtp_parameters.dart';
 import 'dart:math' show Random;
 
+String getCodecName(RtpCodecParameters codec) {
+  RegExp mimeTypeRegex = RegExp(r"^(audio|video)/(.+)", caseSensitive: true);
+  Iterable<RegExpMatch> mimeTypeMatch =
+      mimeTypeRegex.allMatches(codec.mimeType);
+
+  if (mimeTypeMatch.isEmpty) {
+    throw ('invalid codec.mimeType');
+  }
+
+  return mimeTypeMatch.first.group(2)!;
+}
+
 class Rtp {
   final int payload;
   final String codec;
@@ -213,7 +225,7 @@ class Ssrc {
 
 class SsrcGroup {
   final String semantics;
-  final List<int> ssrcs;
+  final List<dynamic> ssrcs;
 
   SsrcGroup({
     required this.semantics,
@@ -222,32 +234,36 @@ class SsrcGroup {
 
   SsrcGroup.fromMap(Map data)
       : semantics = data['semantics'],
-        ssrcs = _parseSsrcs(data['ssrcs']);
+        ssrcs = _parseSsrcs(data['ssrcs']); // NEW: Parse helper
 
-  static List<int> _parseSsrcs(dynamic raw) {
-    if (raw is String) {
-      return raw
+  static List<int> _parseSsrcs(dynamic rawSsrcs) {
+    // NEW: Handle String or List
+    print(
+        'DEBUG: Parsing SSRCs: raw=$rawSsrcs, type=${rawSsrcs.runtimeType}'); // DEBUG
+    if (rawSsrcs is String) {
+      return rawSsrcs
           .split(' ')
-          .map<int>((s) => int.tryParse(s) ?? Random().nextInt(4294967295))
+          .map((s) => int.tryParse(s) ?? 0)
+          .where((s) => s != 0)
           .toList();
-    } else if (raw is Map) {
-      return raw.values
-          .map<int>(
-              (v) => int.tryParse(v.toString()) ?? Random().nextInt(4294967295))
+    } else if (rawSsrcs is List) {
+      return rawSsrcs
+          .map((s) => int.tryParse(s.toString()) ?? 0)
+          .where((s) => s != 0)
           .toList();
-    } else if (raw is List) {
-      return raw
-          .map<int>(
-              (v) => int.tryParse(v.toString()) ?? Random().nextInt(4294967295))
-          .toList();
-    }
-    return <int>[];
+    }else if (rawSsrcs is Map) { // Fix IdentityMap
+      return rawSsrcs.values.map((s) => int.tryParse(s.toString()) ?? 0).where((s) => s != 0).toList();
+  }
+    print('ERROR: Invalid SSRCs type: ${rawSsrcs.runtimeType}'); // DEBUG
+    return [];
   }
 
   Map<String, dynamic> toMap() {
+    print(
+        'DEBUG: Serializing SsrcGroup: semantics=$semantics, ssrcs=$ssrcs'); // DEBUG
     return {
       'semantics': semantics,
-      'ssrcs': ssrcs.map((i) => i.toString()).join(' '),
+      'ssrcs': ssrcs.join(' '), // Store as String for SDP compatibility
     };
   }
 }
@@ -1377,11 +1393,40 @@ class OfferMediaSection extends MediaSection {
           _mediaObject.rtcpMux = 'rtcp-mux';
           _mediaObject.rtcpRsize = 'rtcp-rsize';
 
-          RtpEncodingParameters encoding = offerRtpParameters!.encodings.first;
-          int ssrc = encoding.ssrc!;
+          // Ensure offerRtpParameters and encodings are valid
+          if (offerRtpParameters == null ||
+              offerRtpParameters.encodings.isEmpty) {
+            print(
+                'DEBUG: OfferMediaSection: No offerRtpParameters or encodings, using fallback');
+            offerRtpParameters = RtpParameters(
+              encodings: [
+                RtpEncodingParameters(
+                  ssrc: Random().nextInt(4294967295),
+                  maxBitrate: 5000000,
+                ),
+              ],
+              rtcp: RtcpParameters(cname: 'cname-${Random().nextInt(1000000)}'),
+            );
+          }
+
+          RtpEncodingParameters encoding = offerRtpParameters.encodings.first;
+          int ssrc =
+              encoding.ssrc ?? Random().nextInt(4294967295); // Fallback SSRC
           int? rtxSsrc = (encoding.rtx != null && encoding.rtx!.ssrc != null)
-              ? encoding.rtx?.ssrc
+              ? encoding.rtx!.ssrc
               : null;
+
+          print(
+              'DEBUG: OfferMediaSection: Using SSRC=$ssrc, RTX SSRC=$rtxSsrc');
+
+          // Ensure rtcp.cname is set
+          if (offerRtpParameters.rtcp == null ||
+              offerRtpParameters.rtcp!.cname?.isNotEmpty != true) {
+            print(
+                'DEBUG: OfferMediaSection: No valid rtcp.cname, using fallback');
+            offerRtpParameters.rtcp =
+                RtcpParameters(cname: 'cname-${Random().nextInt(1000000)}');
+          }
 
           _mediaObject.ssrcs = <Ssrc>[];
           _mediaObject.ssrcGroups = [];
@@ -1392,6 +1437,8 @@ class OfferMediaSection extends MediaSection {
               attribute: 'cname',
               value: offerRtpParameters.rtcp!.cname!,
             ));
+            print(
+                'DEBUG: OfferMediaSection: Added cname SSRC: id=$ssrc, cname=${offerRtpParameters.rtcp!.cname}');
           }
 
           if (_planB) {
@@ -1400,6 +1447,8 @@ class OfferMediaSection extends MediaSection {
               attribute: 'msid',
               value: '${streamId ?? '-'} $trackId',
             ));
+            print(
+                'DEBUG: OfferMediaSection: Added msid SSRC: id=$ssrc, msid=${streamId ?? '-'} $trackId');
           }
 
           if (rtxSsrc != null) {
@@ -1409,6 +1458,8 @@ class OfferMediaSection extends MediaSection {
                 attribute: 'cname',
                 value: offerRtpParameters.rtcp!.cname!,
               ));
+              print(
+                  'DEBUG: OfferMediaSection: Added RTX cname SSRC: id=$rtxSsrc, cname=${offerRtpParameters.rtcp!.cname}');
             }
 
             if (_planB) {
@@ -1417,15 +1468,18 @@ class OfferMediaSection extends MediaSection {
                 attribute: 'msid',
                 value: '${streamId ?? '-'} $trackId',
               ));
+              print(
+                  'DEBUG: OfferMediaSection: Added RTX msid SSRC: id=$rtxSsrc, msid=${streamId ?? '-'} $trackId');
             }
 
             // Associate original and retransmission SSRCs.
             _mediaObject.ssrcGroups!.add(SsrcGroup(
               semantics: 'FID',
-              ssrcs: [ssrc, rtxSsrc!], // As list of ints, not string
+              ssrcs: [ssrc, rtxSsrc],
             ));
+            print(
+                'DEBUG: OfferMediaSection: Added FID group: ssrc=$ssrc, rtxSsrc=$rtxSsrc');
           }
-
           break;
         }
 
@@ -1450,7 +1504,9 @@ class OfferMediaSection extends MediaSection {
     }
   }
 
-  OfferMediaSection.fromMap(Map data) : super.fromMap(data);
+  OfferMediaSection.fromMap(Map data) : super.fromMap(data) {
+    _mediaObject = MediaObject.fromMap(data);
+  }
 
   @override
   void setDtlsRole(DtlsRole role) {
@@ -1463,78 +1519,133 @@ class OfferMediaSection extends MediaSection {
     String? streamId,
     required String trackId,
   }) {
+    print('DEBUG: planBReceive: ssrc=${offerRtpParameters.encodings.isNotEmpty ? offerRtpParameters.encodings.first.ssrc : 'none'}, rtxSsrc=${offerRtpParameters.encodings.isNotEmpty && offerRtpParameters.encodings.first.rtx != null ? offerRtpParameters.encodings.first.rtx!.ssrc : 'none'}, streamId=$streamId, trackId=$trackId');
+    
+    if (offerRtpParameters.encodings.isEmpty) {
+      print('DEBUG: planBReceive: No encodings, adding fallback');
+      offerRtpParameters.encodings = [
+        RtpEncodingParameters(
+          ssrc: Random().nextInt(4294967295),
+          maxBitrate: 5000000,
+        ),
+      ];
+    }
+
     RtpEncodingParameters encoding = offerRtpParameters.encodings.first;
-    int ssrc = encoding.ssrc!;
-    int? rtxSsrc = (encoding.rtx != null && encoding.rtx!.ssrc != null)
+    int ssrc = encoding.ssrc ?? Random().nextInt(4294967295);
+    int? rtxSsrc = (encoding.rtx != null && encoding.rtx?.ssrc != null)
         ? encoding.rtx!.ssrc
         : null;
 
+    print('DEBUG: planBReceive: Using SSRC=$ssrc, RTX SSRC=$rtxSsrc');
+
+    // Initialize collections if needed
+    _mediaObject.ssrcs ??= <Ssrc>[];
+    _mediaObject.ssrcGroups ??= <SsrcGroup>[];
+
+    // Add cname SSRC
     if (offerRtpParameters.rtcp?.cname?.isNotEmpty == true) {
       _mediaObject.ssrcs!.add(Ssrc(
         id: ssrc,
         attribute: 'cname',
         value: offerRtpParameters.rtcp!.cname!,
       ));
+      print(
+          'DEBUG: planBReceive: Added cname SSRC: id=$ssrc, cname=${offerRtpParameters.rtcp!.cname}');
+    } else {
+      print('DEBUG: planBReceive: No valid cname, using fallback');
+      _mediaObject.ssrcs!.add(Ssrc(
+        id: ssrc,
+        attribute: 'cname',
+        value: 'cname-${Random().nextInt(1000000)}',
+      ));
     }
 
+    // Add msid SSRC
     _mediaObject.ssrcs!.add(Ssrc(
       id: ssrc,
       attribute: 'msid',
       value: '${streamId ?? '-'} $trackId',
     ));
+    print(
+        'DEBUG: planBReceive: Added msid SSRC: id=$ssrc, msid=${streamId ?? '-'} $trackId');
 
+    // Handle RTX SSRC if present
     if (rtxSsrc != null) {
+      // Add RTX cname SSRC
       if (offerRtpParameters.rtcp?.cname?.isNotEmpty == true) {
         _mediaObject.ssrcs!.add(Ssrc(
           id: rtxSsrc,
           attribute: 'cname',
           value: offerRtpParameters.rtcp!.cname!,
         ));
+        print(
+            'DEBUG: planBReceive: Added RTX cname SSRC: id=$rtxSsrc, cname=${offerRtpParameters.rtcp!.cname}');
+      } else {
+        print('DEBUG: planBReceive: No valid RTX cname, using fallback');
+        _mediaObject.ssrcs!.add(Ssrc(
+          id: rtxSsrc,
+          attribute: 'cname',
+          value: 'cname-${Random().nextInt(1000000)}',
+        ));
       }
 
+      // Add RTX msid SSRC
       _mediaObject.ssrcs!.add(Ssrc(
         id: rtxSsrc,
         attribute: 'msid',
         value: '${streamId ?? '-'} $trackId',
       ));
+      print(
+          'DEBUG: planBReceive: Added RTX msid SSRC: id=$rtxSsrc, msid=${streamId ?? '-'} $trackId');
 
-      // Associate original and retransmission SSRCs.
+      // Add FID group for original and RTX SSRCs
       _mediaObject.ssrcGroups!.add(SsrcGroup(
         semantics: 'FID',
-        ssrcs: [ssrc, rtxSsrc!], // As list of ints, not string
+        ssrcs: [ssrc, rtxSsrc],
       ));
+      print(
+          'DEBUG: planBReceive: Added FID group: ssrc=$ssrc, rtxSsrc=$rtxSsrc');
     }
   }
 
   void planBStopReceiving({
     required RtpParameters offerRtpParameters,
   }) {
+    if (offerRtpParameters.encodings.isEmpty) {
+      print('DEBUG: planBStopReceiving: No encodings provided');
+      return;
+    }
+
+    // Ensure collections are initialized
+    _mediaObject.ssrcs ??= <Ssrc>[];
+    _mediaObject.ssrcGroups ??= <SsrcGroup>[];
+
     RtpEncodingParameters encoding = offerRtpParameters.encodings.first;
-    int ssrc = encoding.ssrc!;
+    int ssrc = encoding.ssrc ?? Random().nextInt(4294967295); // Fallback SSRC
     int? rtxSsrc = (encoding.rtx != null && encoding.rtx?.ssrc != null)
         ? encoding.rtx!.ssrc
         : null;
 
-    _mediaObject.ssrcs = _mediaObject.ssrcs!
-        .where((Ssrc s) => s.id != ssrc && s.id != rtxSsrc)
-        .toList();
+    print('DEBUG: planBStopReceiving: Removing SSRC=$ssrc, RTX SSRC=$rtxSsrc');
 
-    if (rtxSsrc != null) {
-      _mediaObject.ssrcGroups = _mediaObject.ssrcGroups!
-          .where((SsrcGroup group) => group.ssrcs != '$ssrc $rtxSsrc')
+    // Remove SSRCs matching the given SSRC or RTX SSRC
+    if (_mediaObject.ssrcs != null) {
+      _mediaObject.ssrcs = _mediaObject.ssrcs!
+          .where(
+              (Ssrc s) => s.id != ssrc && (rtxSsrc == null || s.id != rtxSsrc))
           .toList();
     }
+
+    // Remove SSRC groups containing the given SSRC or RTX SSRC
+    if (rtxSsrc != null && _mediaObject.ssrcGroups != null) {
+      _mediaObject.ssrcGroups = _mediaObject.ssrcGroups!
+          .where((SsrcGroup group) =>
+              !group.ssrcs.contains(ssrc) && !group.ssrcs.contains(rtxSsrc))
+          .toList();
+    }
+
+    print(
+        'DEBUG: planBStopReceiving: Removed SSRCs: ssrc=$ssrc, rtxSsrc=$rtxSsrc');
   }
-}
-
-String getCodecName(RtpCodecParameters codec) {
-  RegExp? mimeTypeRegex = RegExp(r"^(audio|video)/(.+)", caseSensitive: true);
-  Iterable<RegExpMatch> mimeTypeMatch =
-      mimeTypeRegex.allMatches(codec.mimeType);
-
-  if (mimeTypeMatch == null) {
-    throw ('invalid codec.mimeType');
-  }
-
-  return mimeTypeMatch.elementAt(0).group(2)!;
 }
