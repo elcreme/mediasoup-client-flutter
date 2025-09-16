@@ -19,6 +19,72 @@ import 'package:mediasoup_client_flutter/src/handlers/sdp/media_section.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/remote_sdp.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/unified_plan_utils.dart';
 
+// Helper function to safely extract values that might be wrapped in IdentityMap
+// 🚨 CRITICAL FIX: Enhanced IdentityMap handling for all cases
+dynamic _safeExtractValue(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  
+  if (value is Map) {
+    // Handle IdentityMap<String, dynamic> case
+    print('DEBUG: _safeExtractValue: Processing IdentityMap with keys: ${value.keys.toList()}');
+    print('DEBUG: _safeExtractValue: Processing IdentityMap with values: ${value.values.toList()}');
+    
+    if (value.isEmpty) {
+      return null;
+    }
+    
+    // Try multiple approaches to extract meaningful value
+    List<dynamic> candidateValues = [];
+    
+    // Approach 1: Use values directly
+    candidateValues.addAll(value.values);
+    
+    // Approach 2: Check if values are also Maps (nested IdentityMap)
+    for (dynamic val in value.values) {
+      if (val is Map && val.isNotEmpty) {
+        candidateValues.addAll(val.values);
+      } else if (val is int) {
+        candidateValues.add(val);
+      } else if (val is String) {
+        int? parsed = int.tryParse(val);
+        if (parsed != null) candidateValues.add(parsed);
+        else candidateValues.add(val);
+      }
+    }
+    
+    // Approach 3: Check if keys contain meaningful values
+    for (dynamic key in value.keys) {
+      if (key is String) {
+        int? parsed = int.tryParse(key);
+        if (parsed != null) candidateValues.add(parsed);
+        else candidateValues.add(key);
+      } else if (key is int) {
+        candidateValues.add(key);
+      }
+    }
+    
+    // Process candidate values and return the first meaningful one
+    for (dynamic candidate in candidateValues) {
+      if (candidate != null) {
+        if (candidate is Map) {
+          // Nested map, recurse
+          dynamic nested = _safeExtractValue(candidate);
+          if (nested != null) return nested;
+        } else {
+          return candidate;
+        }
+      }
+    }
+    
+    // If no meaningful value found, return the first value
+    return value.values.first;
+  }
+  
+  return value;
+}
+
 Logger _logger = Logger('Unified plan handler');
 
 class UnifiedPlan extends HandlerInterface {
@@ -597,9 +663,16 @@ Future<HandlerSendResult> send(HandlerSendOptions options) async {
     );
   }
 
-  // Get MID
-  String? localId = transceiver.mid;
-  if (localId == null) throw Exception('Transceiver MID is null');
+  // Get MID using the safe extraction helper
+  dynamic midValue = _safeExtractValue(transceiver.mid);
+  String? localId = midValue?.toString();
+  
+  if (localId == null) {
+    _logger.error('Transceiver MID is null');
+    throw Exception('Transceiver MID is null');
+  }
+  
+  _logger.debug('Using MID: $localId');
 
   // Set MID
   sendingRtpParameters.mid = localId;
@@ -800,15 +873,40 @@ Future<HandlerSendResult> send(HandlerSendOptions options) async {
   Future<void> stopReceiving(String localId) async {
     _assertRecvDirection();
 
-    _logger.debug('stopReceiving() [localId:$localId');
+    _logger.debug('stopReceiving() [localId:$localId]');
 
     RTCRtpTransceiver? transceiver = _mapMidTransceiver[localId];
 
     if (transceiver == null) {
-      throw ('associated RTCRtpTransceiveer not found');
+      throw ('associated RTCRtpTransceiver not found');
     }
 
-    _remoteSdp.closeMediaSection(transceiver.mid);
+    // For receiving track, we need to stop the transceiver
+    await transceiver.setDirection(TransceiverDirection.Inactive);
+    
+    // 🚨 CRITICAL FIX: Use _safeExtractValue for IdentityMap handling
+    dynamic midValue = transceiver.mid;
+    String midString;
+    
+    if (midValue is Map) {
+      // Handle IdentityMap<String, dynamic> case
+      _logger.debug('stopReceiving: Found IdentityMap mid: $midValue');
+      
+      // Use the enhanced helper function
+      dynamic extractedValue = _safeExtractValue(midValue);
+      
+      if (extractedValue != null) {
+        midString = extractedValue.toString();
+      } else {
+        midString = '0'; // fallback
+      }
+    } else if (midValue != null) {
+      midString = midValue.toString();
+    } else {
+      midString = '0'; // fallback
+    }
+    
+    _remoteSdp.closeMediaSection(midString);
 
     RTCSessionDescription offer =
         RTCSessionDescription(_remoteSdp.getSdp(), 'offer');
@@ -839,9 +937,30 @@ Future<HandlerSendResult> send(HandlerSendOptions options) async {
       throw ('associated RTCRtpTransceiver not found');
     }
 
-    // await transceiver.sender.replaceTrack(null);
     await _pc!.removeTrack(transceiver.sender);
-    _remoteSdp.closeMediaSection(transceiver.mid);
+    
+    // Use _safeExtractValue for IdentityMap handling
+    dynamic midValue = transceiver.mid;
+    String midString;
+    
+    if (midValue is Map) {
+      // Handle IdentityMap<String, dynamic> case
+      _logger.debug('stopSending: Found IdentityMap mid: $midValue');
+      
+      // Use the enhanced helper function
+      dynamic extractedValue = _safeExtractValue(midValue);
+      
+      if (extractedValue != null) {
+        midString = extractedValue.toString();
+      } else {
+        midString = '0'; // fallback
+      }
+    } else {
+      // Handle normal string case
+      midString = midValue.toString();
+    }
+    
+    _remoteSdp.closeMediaSection(midString);
 
     RTCSessionDescription offer = await _pc!.createOffer({});
 

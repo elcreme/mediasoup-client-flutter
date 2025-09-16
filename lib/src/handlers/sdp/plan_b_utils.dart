@@ -2,6 +2,30 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:mediasoup_client_flutter/src/rtp_parameters.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/media_section.dart';
 
+// Helper function to safely extract values that might be wrapped in IdentityMap
+dynamic _safeExtractValue(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+
+  if (value is Map) {
+    // Handle IdentityMap case - try to extract meaningful value
+    if (value.isNotEmpty) {
+      // Try to find a non-null, non-empty value
+      for (var entry in value.entries) {
+        if (entry.value != null && entry.value.toString().isNotEmpty) {
+          return entry.value;
+        }
+      }
+      // If no meaningful value found, return the first key as string
+      return value.keys.first.toString();
+    }
+    return null;
+  }
+
+  return value;
+}
+
 class PlanBUtils {
   static List<RtpEncodingParameters> getRtpEncodings(
     MediaObject offerMediaObject,
@@ -19,7 +43,7 @@ class PlanBUtils {
       String trackId = line.value.split(' ')[1];
 
       if (trackId == track.id) {
-        int ssrc = line.id!;
+        int ssrc = _safeExtractValue(line.id) ?? 0; // Handle IdentityMap
 
         ssrcs.add(ssrc);
 
@@ -41,7 +65,7 @@ class PlanBUtils {
         continue;
       }
 
-      List<String> tokens = line.ssrcs.split(' ');
+      List<String> tokens = line.ssrcs.toString().split(' ');
 
       int? ssrc;
       if (tokens.length > 0) {
@@ -112,7 +136,7 @@ class PlanBUtils {
         String trackId = line.value.split(' ')[1];
 
         if (trackId == track.id) {
-          firstSsrc = line.id;
+          firstSsrc = _safeExtractValue(line.id) ?? 0; // Handle IdentityMap
           streamId = line.value.split(' ')[0];
 
           return true;
@@ -133,7 +157,7 @@ class PlanBUtils {
         return false;
       }
 
-      List<String> ssrcs = line.ssrcs.split(' ');
+      List<String> ssrcs = line.ssrcs.toString().split(' ');
 
       if (int.parse(ssrcs.first) == firstSsrc) {
         firstRtxSsrc = int.parse(ssrcs[1]);
@@ -170,7 +194,7 @@ class PlanBUtils {
 
     offerMediaObject.ssrcGroups!.add(SsrcGroup(
       semantics: 'SIM',
-      ssrcs: ssrcs.join(' '),
+      ssrcs: ssrcs.map((ssrc) => ssrc.toString()).toList(),
     ));
 
     for (int i = 0; i < ssrcs.length; ++i) {
@@ -207,7 +231,7 @@ class PlanBUtils {
 
       offerMediaObject.ssrcGroups!.add(SsrcGroup(
         semantics: 'FID',
-        ssrcs: '$ssrc $rtxSsrc',
+        ssrcs: [ssrc, rtxSsrc],
       ));
     }
   }

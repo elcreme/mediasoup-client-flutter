@@ -164,7 +164,7 @@ class CommonUtils {
   static String getCname(MediaObject offerMediaObject) {
     Ssrc ssrcCnameLine = (offerMediaObject.ssrcs ?? []).firstWhere(
       (Ssrc ssrc) => ssrc.attribute == 'cname',
-      orElse: () => Ssrc(value: ''),
+      orElse: () => Ssrc(attribute: 'cname', value: ''),
     );
 
     return ssrcCnameLine.value;

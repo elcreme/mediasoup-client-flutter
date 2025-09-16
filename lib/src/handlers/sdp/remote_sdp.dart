@@ -63,7 +63,7 @@ class RemoteSdp {
     bool planB = false,
   }) {
     _iceParameters = iceParameters;
-    _iceCandidates = iceCandidates;
+   _iceCandidates = List<IceCandidate>.from(iceCandidates.where((c) => c is IceCandidate));
     _dtlsParameters = dtlsParameters;
     _sctpParameters = sctpParameters;
     _plainRtpParameters = plainRtpParameters;

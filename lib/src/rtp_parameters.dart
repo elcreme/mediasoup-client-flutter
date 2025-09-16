@@ -744,10 +744,7 @@ class RtpParameters {
         encodings = List<RtpEncodingParameters>.from(data['encodings']
             .map((encoding) => RtpEncodingParameters.fromMap(encoding))
             .toList()),
-        rtcp = RtcpParameters.fromMap(data['rtcp']) {
-    print('DEBUG: RtpParameters.fromMap: mid=$mid, codecs=${codecs.length}, headerExtensions=${headerExtensions.length}, encodings=${encodings.length}');
-    print('DEBUG: RtpParameters.fromMap: encodings=${encodings.map((e) => 'ssrc=${e.ssrc}${e.rtx != null ? ', rtx=${e.rtx!.ssrc}' : ''}').join('; ')}');
-  }
+        rtcp = RtcpParameters.fromMap(data['rtcp']);
 
   static RtpParameters copy(
     RtpParameters old, {

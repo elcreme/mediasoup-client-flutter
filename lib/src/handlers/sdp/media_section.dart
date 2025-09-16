@@ -5,6 +5,76 @@ import 'package:mediasoup_client_flutter/src/transport.dart';
 import 'package:mediasoup_client_flutter/src/rtp_parameters.dart';
 import 'dart:math' show Random;
 
+// Helper function to safely extract values that might be wrapped in IdentityMap
+dynamic _safeExtractValue(dynamic value) {
+  if (value == null) {
+    return null;
+  }
+  
+  if (value is Map) {
+    // Handle IdentityMap case - try to extract meaningful value
+    if (value.isNotEmpty) {
+      // Try to find a non-null, non-empty value
+      for (var entry in value.entries) {
+        if (entry.value != null && entry.value.toString().isNotEmpty) {
+          return entry.value;
+        }
+      }
+      // If no non-null values found, return the first value (even if null/empty)
+      return value.values.firstOrNull;
+    }
+    return null;
+  }
+  
+  return value;
+}
+
+/// Helper class for parsing SDP lines
+class SdpParser {
+  /// Parse an a=ssrc line into an Ssrc object
+  static Ssrc? parseSsrc(String line) {
+    print('DEBUG: parseSsrc: line=$line');
+    var parts = line.split(' ');
+    if (parts.length < 3) return null;
+    
+    var id = int.tryParse(parts[1]);
+    if (id == null) return null;
+    
+    var attr = parts[2];
+    var valParts = parts.sublist(3);
+    var val = valParts.join(' ');
+    
+    print('DEBUG: parseSsrc: id=$id, attr=$attr, val=$val');
+    return Ssrc(
+      id: id,
+      attribute: attr,
+      value: val,
+    );
+  }
+
+  /// Parse an a=ssrc-group line into an SsrcGroup object
+  static SsrcGroup? parseSsrcGroup(String line) {
+    print('DEBUG: parseSsrcGroup: line=$line');
+    var parts = line.split(' ');
+    if (parts.length < 3) return null;
+    
+    var semantics = parts[1];
+    var ssrcs = parts.sublist(2)
+        .map((s) => int.tryParse(s))
+        .where((s) => s != null)
+        .cast<int>()
+        .toList();
+    
+    if (ssrcs.isEmpty) return null;
+    
+    print('DEBUG: parseSsrcGroup: semantics=$semantics, ssrcs=$ssrcs');
+    return SsrcGroup(
+      semantics: semantics,
+      ssrcs: ssrcs,
+    );
+  }
+}
+
 String getCodecName(RtpCodecParameters codec) {
   RegExp mimeTypeRegex = RegExp(r"^(audio|video)/(.+)", caseSensitive: true);
   Iterable<RegExpMatch> mimeTypeMatch =
@@ -200,19 +270,19 @@ class RtcpFb {
 
 class Ssrc {
   final int? id;
-  final String? attribute;
-  final String value;
+  final String attribute;
+  String value; // FIX: Force String for value
 
   Ssrc({
     this.id,
-    this.attribute,
+    required this.attribute,
     required this.value,
   });
 
   Ssrc.fromMap(Map data)
       : id = data['id'],
         attribute = data['attribute'],
-        value = data['value'];
+        value = _safeExtractValue(data['value'])?.toString() ?? ''; // FIX: Handle IdentityMap
 
   Map<String, dynamic> toMap() {
     return {
@@ -225,7 +295,7 @@ class Ssrc {
 
 class SsrcGroup {
   final String semantics;
-  final List<dynamic> ssrcs;
+  List<dynamic> ssrcs; // FIX: List<dynamic> to handle List or Map
 
   SsrcGroup({
     required this.semantics,
@@ -234,36 +304,12 @@ class SsrcGroup {
 
   SsrcGroup.fromMap(Map data)
       : semantics = data['semantics'],
-        ssrcs = _parseSsrcs(data['ssrcs']); // NEW: Parse helper
-
-  static List<int> _parseSsrcs(dynamic rawSsrcs) {
-    // NEW: Handle String or List
-    print(
-        'DEBUG: Parsing SSRCs: raw=$rawSsrcs, type=${rawSsrcs.runtimeType}'); // DEBUG
-    if (rawSsrcs is String) {
-      return rawSsrcs
-          .split(' ')
-          .map((s) => int.tryParse(s) ?? 0)
-          .where((s) => s != 0)
-          .toList();
-    } else if (rawSsrcs is List) {
-      return rawSsrcs
-          .map((s) => int.tryParse(s.toString()) ?? 0)
-          .where((s) => s != 0)
-          .toList();
-    }else if (rawSsrcs is Map) { // Fix IdentityMap
-      return rawSsrcs.values.map((s) => int.tryParse(s.toString()) ?? 0).where((s) => s != 0).toList();
-  }
-    print('ERROR: Invalid SSRCs type: ${rawSsrcs.runtimeType}'); // DEBUG
-    return [];
-  }
+        ssrcs = data['ssrcs'] ?? []; // Default empty List
 
   Map<String, dynamic> toMap() {
-    print(
-        'DEBUG: Serializing SsrcGroup: semantics=$semantics, ssrcs=$ssrcs'); // DEBUG
     return {
       'semantics': semantics,
-      'ssrcs': ssrcs.join(' '), // Store as String for SDP compatibility
+      'ssrcs': ssrcs,
     };
   }
 }
@@ -481,11 +527,11 @@ class SourceFilter {
   });
 
   SourceFilter.fromMap(Map data)
-      : this.filterMode = data['filterMode'],
-        this.netType = data['netType'],
-        this.addressTypes = data['addressTypes'],
-        this.destAddress = data['destAddress'],
-        this.srcList = data['srcList'];
+      : filterMode = data['filterMode'],
+        netType = data['netType'],
+        addressTypes = data['addressTypes'],
+        destAddress = data['destAddress'],
+        srcList = data['srcList'];
 
   Map<String, String> toMap() {
     return {
@@ -495,6 +541,18 @@ class SourceFilter {
       'destAddress': destAddress,
       'srcList': srcList,
     };
+  }
+}
+
+class Invalid {
+  final String value;
+
+  Invalid({required this.value});
+
+  Invalid.fromMap(Map data) : value = data['value'];
+
+  Map<String, String> toMap() {
+    return {'value': value};
   }
 }
 
@@ -614,7 +672,7 @@ class MediaObject {
       setup = data['setup'];
     }
     if (data['mid'] != null) {
-      mid = data['mid'].toString();
+      mid = _safeExtractValue(data['mid'])?.toString() ?? '';
     }
     if (data['port'] != null) {
       port = data['port'];
@@ -660,13 +718,43 @@ class MediaObject {
           (data['rtcpFb'] ?? []).map((r) => RtcpFb.fromMap(r)).toList());
     }
     if (data['ssrcs'] != null) {
-      ssrcs = List<Ssrc>.from(
-          (data['ssrcs'] ?? []).map((ssrc) => Ssrc.fromMap(ssrc)).toList());
+      ssrcs = [];
+      for (var ssrc in data['ssrcs'] ?? []) {
+        if (ssrc is String) {
+          // Raw SDP line (e.g., "a=ssrc:123 cname:abc")
+          var parsedSsrc = SdpParser.parseSsrc(ssrc);
+          if (parsedSsrc != null) {
+            ssrcs!.add(parsedSsrc);
+          }
+        } else if (ssrc is Map) {
+          // sdp_transform Map output
+          ssrcs!.add(Ssrc.fromMap({
+            'id': ssrc['id'],
+            'attribute': ssrc['attribute'],
+            'value': _safeExtractValue(ssrc['value'])?.toString() ?? '', // Handle IdentityMap
+          }));
+        }
+      }
     }
     if (data['ssrcGroups'] != null) {
-      ssrcGroups = List<SsrcGroup>.from((data['ssrcGroups'] ?? [])
-          .map((ssrcGroup) => SsrcGroup.fromMap(ssrcGroup))
-          .toList());
+      ssrcGroups = [];
+      for (var group in data['ssrcGroups'] ?? []) {
+        if (group is String) {
+          // Raw SDP line (e.g., "a=ssrc-group:FID 123 456")
+          var parsedGroup = SdpParser.parseSsrcGroup(group);
+          if (parsedGroup != null) {
+            ssrcGroups!.add(parsedGroup);
+          }
+        } else if (group is Map) {
+          // sdp_transform Map output
+          ssrcGroups!.add(SsrcGroup.fromMap({
+            'semantics': group['semantics'],
+            'ssrcs': (group['ssrcs'] is String
+                    ? group['ssrcs'].split(' ').map((s) => int.tryParse(s)).where((s) => s != null).cast<int>().toList()
+                    : group['ssrcs']) ?? [],
+          }));
+        }
+      }
     }
     if (data['simulcast'] != null) {
       simulcast = Simulcast.fromMap(data['simulcast']);
@@ -702,7 +790,7 @@ class MediaObject {
     }
     if (data['rtcpFbTrrInt'] != null) {
       rtcpFbTrrInt = List<RtcpFbTrrInt>.from((data['rtcpFbTrrInt'] ?? [])
-          .map((rFTI) => RtcpFbTrrInt.fromMap(data['rtcpFbTrrInt']))
+          .map((rFTI) => RtcpFbTrrInt.fromMap(rFTI))
           .toList());
     }
     if (data['crypto'] != null) {
@@ -710,8 +798,14 @@ class MediaObject {
           (data['crypto'] ?? []).map((c) => Crypto.fromMap(c)).toList());
     }
     if (data['invalid'] != null) {
-      invalid = List<Invalid>.from(
-          (data['invalid'] ?? []).map((i) => Invalid.fromMap(i)).toList());
+      invalid = [];
+      for (var i in (data['invalid'] ?? [])) {
+        try {
+          invalid!.add(Invalid.fromMap(i is Map ? i : {'value': i.toString()}));
+        } catch (e) {
+          print('DEBUG: Failed to parse invalid SDP line: $i, error: $e');
+        }
+      }
     }
     if (data['ptime'] != null) {
       ptime = data['ptime'];
@@ -810,11 +904,11 @@ class MediaObject {
       result['rtcpFb'] = rtcpFb!.map((RtcpFb rfb) => rfb.toMap()).toList();
     }
     if (ssrcs != null) {
-      result['ssrcs'] = ssrcs!.map((Ssrc s) => s.toMap()).toList();
+      result['ssrcs'] = ssrcs?.map((Ssrc s) => s.toMap()).toList();
     }
     if (ssrcGroups != null) {
       result['ssrcGroups'] =
-          ssrcGroups!.map((SsrcGroup sg) => sg.toMap()).toList();
+          ssrcGroups?.map((SsrcGroup sg) => sg.toMap()).toList();
     }
     if (simulcast != null) {
       result['simulcast'] = simulcast!.toMap();
