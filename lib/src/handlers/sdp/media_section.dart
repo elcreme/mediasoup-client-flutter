@@ -1,1745 +1,543 @@
-import 'package:mediasoup_client_flutter/src/producer.dart';
-import 'package:mediasoup_client_flutter/src/sctp_parameters.dart';
-import 'package:mediasoup_client_flutter/src/sdp_object.dart';
-import 'package:mediasoup_client_flutter/src/transport.dart';
+import 'dart:math';
+import 'dart:convert';
+import 'package:sdp_transform/sdp_transform.dart';
 import 'package:mediasoup_client_flutter/src/rtp_parameters.dart';
-import 'dart:math' show Random;
+import 'package:mediasoup_client_flutter/src/sctp_parameters.dart';
+import 'package:mediasoup_client_flutter/src/transport.dart';
 
-// Helper function to safely extract values that might be wrapped in IdentityMap
-dynamic _safeExtractValue(dynamic value) {
-  if (value == null) {
-    return null;
-  }
-  
-  if (value is Map) {
-    // Handle IdentityMap case - try to extract meaningful value
-    if (value.isNotEmpty) {
-      // Try to find a non-null, non-empty value
-      for (var entry in value.entries) {
-        if (entry.value != null && entry.value.toString().isNotEmpty) {
-          return entry.value;
-        }
-      }
-      // If no non-null values found, return the first value (even if null/empty)
-      return value.values.firstOrNull;
-    }
-    return null;
-  }
-  
-  return value;
-}
-
-/// Helper class for parsing SDP lines
-class SdpParser {
-  /// Parse an a=ssrc line into an Ssrc object
-  static Ssrc? parseSsrc(String line) {
-    print('DEBUG: parseSsrc: line=$line');
-    var parts = line.split(' ');
-    if (parts.length < 3) return null;
-    
-    var id = int.tryParse(parts[1]);
-    if (id == null) return null;
-    
-    var attr = parts[2];
-    var valParts = parts.sublist(3);
-    var val = valParts.join(' ');
-    
-    print('DEBUG: parseSsrc: id=$id, attr=$attr, val=$val');
-    return Ssrc(
-      id: id,
-      attribute: attr,
-      value: val,
-    );
-  }
-
-  /// Parse an a=ssrc-group line into an SsrcGroup object
-  static SsrcGroup? parseSsrcGroup(String line) {
-    print('DEBUG: parseSsrcGroup: line=$line');
-    var parts = line.split(' ');
-    if (parts.length < 3) return null;
-    
-    var semantics = parts[1];
-    var ssrcs = parts.sublist(2)
-        .map((s) => int.tryParse(s))
-        .where((s) => s != null)
-        .cast<int>()
-        .toList();
-    
-    if (ssrcs.isEmpty) return null;
-    
-    print('DEBUG: parseSsrcGroup: semantics=$semantics, ssrcs=$ssrcs');
-    return SsrcGroup(
-      semantics: semantics,
-      ssrcs: ssrcs,
-    );
-  }
-}
-
-String getCodecName(RtpCodecParameters codec) {
-  RegExp mimeTypeRegex = RegExp(r"^(audio|video)/(.+)", caseSensitive: true);
-  Iterable<RegExpMatch> mimeTypeMatch =
-      mimeTypeRegex.allMatches(codec.mimeType);
-
-  if (mimeTypeMatch.isEmpty) {
-    throw ('invalid codec.mimeType');
-  }
-
-  return mimeTypeMatch.first.group(2)!;
-}
-
-class Rtp {
-  final int payload;
-  final String codec;
-  final int rate;
-  int? encoding;
-
-  Rtp({
-    required this.payload,
-    required this.codec,
-    required this.rate,
-    this.encoding,
-  });
-
-  Rtp.fromMap(Map data)
-      : payload = data['payload'],
-        codec = data['codec'],
-        rate = data['rate'],
-        encoding = data['encoding'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'payload': payload,
-      'codec': codec,
-      'rate': rate,
-      'encoding': encoding,
-    };
-  }
-}
-
-class Fmtp {
-  final int payload;
-  String config;
-
-  Fmtp({
-    required this.payload,
-    required this.config,
-  });
-
-  Fmtp.fromMap(Map data)
-      : payload = data['payload'],
-        config = data['config'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'payload': payload,
-      'config': config,
-    };
-  }
-}
-
-class Connection {
-  final int version;
-  final String ip;
-
-  Connection({
-    required this.version,
-    required this.ip,
-  });
-
-  Connection.fromMap(Map data)
-      : version = data['version'],
-        ip = data['ip'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'version': version,
-      'ip': ip,
-    };
-  }
-}
-
-class Rtcp {
-  final int port;
-  final String netType;
-  final int ipVer;
-  final String address;
-
-  Rtcp({
-    required this.port,
-    required this.netType,
-    required this.address,
-    required this.ipVer,
-  });
-
-  Rtcp.fromMap(Map data)
-      : port = data['port'],
-        netType = data['netType'],
-        ipVer = data['ipVer'],
-        address = data['address'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'port': port,
-      'netType': netType,
-      'ipVer': ipVer,
-      'address': address,
-    };
-  }
-}
-
-class Fingerprint {
-  final String type;
-  final String hash;
-
-  Fingerprint({
-    required this.type,
-    required this.hash,
-  });
-
-  Fingerprint.fromMap(Map data)
-      : type = data['type'],
-        hash = data['hash'];
-
-  Map<String, String> toMap() {
-    return {
-      'type': type,
-      'hash': hash,
-    };
-  }
-}
-
-class Ext {
-  final int? value;
-  final String? direction;
-  final String? uri;
-  final String? config;
-  final String? encryptUri;
-
-  Ext({
-    this.value,
-    this.direction,
-    this.uri,
-    this.config,
-    this.encryptUri,
-  });
-
-  Ext.fromMap(Map data)
-      : value = data['value'],
-        direction = data['direction'],
-        uri = data['uri'],
-        config = data['config'],
-        encryptUri = data['encrypt-uri'];
-
-  Map<String, dynamic> toMap() {
-    Map<String, dynamic> result = {
-      if (value != null) 'value': value,
-      if (direction != null) 'direction': direction,
-      if (uri != null) 'uri': uri,
-      if (config != null) 'config': config,
-    };
-    if (encryptUri != null && encryptUri!.isNotEmpty) {
-      result['encrypt-uri'] = encryptUri;
-    }
-    return result;
-  }
-}
-
-class RtcpFb {
-  final int payload;
-  final String type;
-  final String subtype;
-
-  RtcpFb({
-    required this.payload,
-    required this.type,
-    this.subtype = '',
-  });
-  RtcpFb.fromMap(Map data)
-      : payload = data['payload'],
-        type = data['type'],
-        subtype = data['subtype'] ?? '';
-
-  Map<String, dynamic> toMap() {
-    return {
-      'payload': payload,
-      'type': type,
-      'subtype': subtype,
-    };
-  }
-}
-
-class Ssrc {
-  final int? id;
-  final String attribute;
-  String value; // FIX: Force String for value
-
-  Ssrc({
-    this.id,
-    required this.attribute,
-    required this.value,
-  });
-
-  Ssrc.fromMap(Map data)
-      : id = data['id'],
-        attribute = data['attribute'],
-        value = _safeExtractValue(data['value'])?.toString() ?? ''; // FIX: Handle IdentityMap
-
-  Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'attribute': attribute,
-      'value': value,
-    };
-  }
-}
-
-class SsrcGroup {
-  final String semantics;
-  List<dynamic> ssrcs; // FIX: List<dynamic> to handle List or Map
-
-  SsrcGroup({
-    required this.semantics,
-    required this.ssrcs,
-  });
-
-  SsrcGroup.fromMap(Map data)
-      : semantics = data['semantics'],
-        ssrcs = data['ssrcs'] ?? []; // Default empty List
-
-  Map<String, dynamic> toMap() {
-    return {
-      'semantics': semantics,
-      'ssrcs': ssrcs,
-    };
-  }
-}
-
-class Sctpmap {
-  final String app;
-  final int sctpmanNumber;
-  final int maxMessageSize;
-
-  Sctpmap({
-    required this.app,
-    required this.sctpmanNumber,
-    required this.maxMessageSize,
-  });
-
-  Sctpmap.fromMap(Map data)
-      : app = data['app'],
-        sctpmanNumber = data['sctpmanNumber'],
-        maxMessageSize = data['maxMessageSize'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'app': app,
-      'sctpmanNumber': sctpmanNumber,
-      'maxMessageSize': maxMessageSize,
-    };
-  }
-}
-
-class Rid {
-  final int id;
-  final String direction;
-  final String? params;
-
-  Rid({
-    required this.id,
-    required this.direction,
-    this.params,
-  });
-
-  Rid.fromMap(Map data)
-      : id = data['id'],
-        direction = data['direction'],
-        params = data['params'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'direction': direction,
-      'params': params,
-    };
-  }
-}
-
-class Simulcast {
-  final String? dir1;
-  final String? list1;
-  final String? dir2;
-  final String? list2;
-
-  Simulcast({
-    this.dir1,
-    this.list1,
-    this.dir2,
-    this.list2,
-  });
-
-  Simulcast.fromMap(Map data)
-      : dir1 = data['dir1'],
-        list1 = data['list1'],
-        dir2 = data['dir2'],
-        list2 = data['list2'];
-
-  Map<String, String?> toMap() {
-    return {
-      'dir1': dir1,
-      'list1': list1,
-      'dir2': dir2,
-      'list2': list2,
-    };
-  }
-}
-
-class Simulcast_03 {
-  final String value;
-
-  Simulcast_03({required this.value});
-
-  Simulcast_03.fromMap(Map data) : value = data['value'];
-
-  Map<String, String> toMap() {
-    return {
-      'value': value,
-    };
-  }
-}
-
-class RtcpFbTrrInt {
-  final int payload;
-  final int value;
-
-  RtcpFbTrrInt({
-    required this.payload,
-    required this.value,
-  });
-
-  RtcpFbTrrInt.fromMap(Map data)
-      : payload = data['payload'],
-        value = data['value'];
-
-  Map<String, int> toMap() {
-    return {
-      'payload': payload,
-      'value': value,
-    };
-  }
-}
-
-class Crypto {
-  final int id;
-  final String suite;
-  final String config;
-  var sessionConfig;
-
-  Crypto({
-    required this.id,
-    required this.suite,
-    required this.config,
-    this.sessionConfig,
-  });
-
-  Crypto.fromMap(Map data)
-      : id = data['id'],
-        suite = data['suite'],
-        config = data['config'],
-        sessionConfig = data['sessionConfig'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'suite': suite,
-      'config': config,
-      'sessionConfig': sessionConfig,
-    };
-  }
-}
-
-class Bandwidth {
-  final String type;
-  final int limit;
-
-  Bandwidth({
-    required this.type,
-    required this.limit,
-  });
-
-  Bandwidth.fromMap(Map data)
-      : type = data['type'],
-        limit = data['limit'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'type': type,
-      'limit': limit,
-    };
-  }
-}
-
-class Imageattrs {
-  final int pt;
-  final String dir1;
-  final String attrs1;
-  final String dir2;
-  final String attrs2;
-
-  Imageattrs({
-    required this.pt,
-    required this.dir1,
-    required this.attrs1,
-    required this.dir2,
-    required this.attrs2,
-  });
-
-  Imageattrs.fromMap(Map data)
-      : pt = data['pt'],
-        dir1 = data['dir1'],
-        attrs1 = data['attrs1'],
-        dir2 = data['dir2'],
-        attrs2 = data['attrs2'];
-
-  Map<String, dynamic> toMap() {
-    return {
-      'pt': pt,
-      'dir1': dir1,
-      'attrs1': attrs1,
-      'dir2': dir2,
-      'attrs2': attrs2,
-    };
-  }
-}
-
-class SourceFilter {
-  final String filterMode;
-  final String netType;
-  final String addressTypes;
-  final String destAddress;
-  final String srcList;
-
-  SourceFilter({
-    required this.filterMode,
-    required this.netType,
-    required this.addressTypes,
-    required this.destAddress,
-    required this.srcList,
-  });
-
-  SourceFilter.fromMap(Map data)
-      : filterMode = data['filterMode'],
-        netType = data['netType'],
-        addressTypes = data['addressTypes'],
-        destAddress = data['destAddress'],
-        srcList = data['srcList'];
-
-  Map<String, String> toMap() {
-    return {
-      'filterMode': filterMode,
-      'netType': netType,
-      'addressTypes': addressTypes,
-      'destAddress': destAddress,
-      'srcList': srcList,
-    };
-  }
-}
-
-class Invalid {
-  final String value;
-
-  Invalid({required this.value});
-
-  Invalid.fromMap(Map data) : value = data['value'];
-
-  Map<String, String> toMap() {
-    return {'value': value};
-  }
-}
-
-class MediaObject {
-  List<IceCandidate>? candidates;
-  String? iceUfrag;
-  String? icePwd;
-  String? endOfCandidates;
-  String? iceOptions;
-
-  /// Always 'actpass'.
-  String? setup;
-  String? mid;
-  int? port;
-  RtpHeaderDirection? direction;
-  List<Rtp>? rtp;
-  List<Fmtp>? fmtp;
-  String? type;
-  String? protocol;
-  String? payloads;
-  Connection? connection;
-  Rtcp? rtcp;
-  List<Ext>? ext;
-  String? msid;
-  String? rtcpMux;
-  List<RtcpFb>? rtcpFb;
-  List<Ssrc>? ssrcs;
-  List<SsrcGroup>? ssrcGroups;
-  Simulcast? simulcast;
-  Simulcast_03? simulcast_03;
-  List<Rid>? rids;
-  bool? extmapAllowMixed;
-  String? rtcpRsize;
-  int? sctpPort;
-  int? maxMessageSize;
-  Sctpmap? sctpmap;
-  String? xGoogleFlag;
-  Fingerprint? fingerprint;
-  List<RtcpFbTrrInt>? rtcpFbTrrInt;
-  List<Crypto>? crypto;
-  List<Invalid>? invalid;
-  int? ptime;
-  int? maxptime;
-  int? label;
-  List<Bandwidth>? bandwidth;
-  String? framerate;
-  String? bundleOnly;
-  List<Imageattrs>? imageattrs;
-  SourceFilter? sourceFilter;
-  String? description;
-
-  MediaObject({
-    this.candidates = const [],
-    this.iceUfrag,
-    this.icePwd,
-    this.endOfCandidates,
-    this.iceOptions,
-    this.setup,
-    this.mid,
-    this.port,
-    this.direction,
-    this.rtp = const [],
-    this.fmtp = const [],
-    this.type,
-    this.protocol,
-    this.payloads,
-    this.connection,
-    this.rtcp,
-    this.ext = const [],
-    this.msid,
-    this.rtcpMux,
-    this.rtcpFb = const [],
-    this.ssrcs = const [],
-    this.extmapAllowMixed = false,
-    this.rids = const [],
-    this.simulcast,
-    this.simulcast_03,
-    this.ssrcGroups = const [],
-    this.rtcpRsize,
-    this.sctpPort,
-    this.maxMessageSize,
-    this.sctpmap,
-    this.xGoogleFlag,
-    this.fingerprint,
-    this.rtcpFbTrrInt = const [],
-    this.invalid = const [],
-    this.ptime,
-    this.maxptime,
-    this.label,
-    this.bandwidth = const [],
-    this.framerate,
-    this.bundleOnly,
-    this.imageattrs = const [],
-    this.sourceFilter,
-    this.description,
-  });
-
-  MediaObject.fromMap(Map data) {
-    if (data['candidates'] != null) {
-      candidates = List<IceCandidate>.from((data['candidates'] ?? [])
-          .map((candidate) => IceCandidate.fromMap(candidate))
-          .toList());
-    }
-    if (data['iceUfrag'] != null) {
-      iceUfrag = data['iceUfrag'];
-    }
-    if (data['icePwd'] != null) {
-      icePwd = data['icePwd'];
-    }
-    if (data['endOfCandidates'] != null) {
-      endOfCandidates = data['endOfCandidates'];
-    }
-    if (data['iceOptions'] != null) {
-      iceOptions = data['iceOptions'];
-    }
-    if (data['setup'] != null) {
-      setup = data['setup'];
-    }
-    if (data['mid'] != null) {
-      mid = _safeExtractValue(data['mid'])?.toString() ?? '';
-    }
-    if (data['port'] != null) {
-      port = data['port'];
-    }
-    if (data['direction'] != null) {
-      direction = RtpHeaderDirectionExtension.fromString(data['direction']);
-    }
-    if (data['rtp'] != null) {
-      rtp = List<Rtp>.from(
-          (data['rtp'] ?? <Rtp>[]).map((r) => Rtp.fromMap(r)).toList());
-    }
-    if (data['fmtp'] != null) {
-      fmtp = List<Fmtp>.from(
-          (data['fmtp'] ?? []).map((f) => Fmtp.fromMap(f)).toList());
-    }
-    if (data['type'] != null) {
-      type = data['type'];
-    }
-    if (data['protocol'] != null) {
-      protocol = data['protocol'];
-    }
-    if (data['payloads'] != null) {
-      payloads = '${data['payloads']}';
-    }
-    if (data['connection'] != null) {
-      connection = Connection.fromMap(data['connection']);
-    }
-    if (data['rtcp'] != null) {
-      rtcp = Rtcp.fromMap(data['rtcp']);
-    }
-    if (data['ext'] != null) {
-      ext = List<Ext>.from(
-          (data['ext'] ?? []).map((e) => Ext.fromMap(e)).toList());
-    }
-    if (data['msid'] != null) {
-      msid = data['msid'];
-    }
-    if (data['rtcpMux'] != null) {
-      rtcpMux = data['rtcpMux'];
-    }
-    if (data['rtcpFb'] != null) {
-      rtcpFb = List<RtcpFb>.from(
-          (data['rtcpFb'] ?? []).map((r) => RtcpFb.fromMap(r)).toList());
-    }
-    if (data['ssrcs'] != null) {
-      ssrcs = [];
-      for (var ssrc in data['ssrcs'] ?? []) {
-        if (ssrc is String) {
-          // Raw SDP line (e.g., "a=ssrc:123 cname:abc")
-          var parsedSsrc = SdpParser.parseSsrc(ssrc);
-          if (parsedSsrc != null) {
-            ssrcs!.add(parsedSsrc);
-          }
-        } else if (ssrc is Map) {
-          // sdp_transform Map output
-          ssrcs!.add(Ssrc.fromMap({
-            'id': ssrc['id'],
-            'attribute': ssrc['attribute'],
-            'value': _safeExtractValue(ssrc['value'])?.toString() ?? '', // Handle IdentityMap
-          }));
-        }
-      }
-    }
-    if (data['ssrcGroups'] != null) {
-      ssrcGroups = [];
-      for (var group in data['ssrcGroups'] ?? []) {
-        if (group is String) {
-          // Raw SDP line (e.g., "a=ssrc-group:FID 123 456")
-          var parsedGroup = SdpParser.parseSsrcGroup(group);
-          if (parsedGroup != null) {
-            ssrcGroups!.add(parsedGroup);
-          }
-        } else if (group is Map) {
-          // sdp_transform Map output
-          ssrcGroups!.add(SsrcGroup.fromMap({
-            'semantics': group['semantics'],
-            'ssrcs': (group['ssrcs'] is String
-                    ? group['ssrcs'].split(' ').map((s) => int.tryParse(s)).where((s) => s != null).cast<int>().toList()
-                    : group['ssrcs']) ?? [],
-          }));
-        }
-      }
-    }
-    if (data['simulcast'] != null) {
-      simulcast = Simulcast.fromMap(data['simulcast']);
-    }
-    if (data['simulcast_03'] != null) {
-      simulcast_03 = Simulcast_03.fromMap(data['simulcast_03']);
-    }
-    if (data['rids'] != null) {
-      rids = List<Rid>.from(
-          (data['rids'] ?? []).map((r) => Rid.fromMap(r)).toList());
-    }
-    if (data['extmapAllowMixed'] != null ||
-        data['extmap-allow-mixed'] != null) {
-      extmapAllowMixed = true;
-    }
-    if (data['rtcpRsize'] != null) {
-      rtcpRsize = data['rtcpRsize'];
-    }
-    if (data['sctpPort'] != null) {
-      sctpPort = data['sctpPort'];
-    }
-    if (data['maxMessageSize'] != null) {
-      maxMessageSize = data['maxMessageSize'];
-    }
-    if (data['sctpmap'] != null) {
-      sctpmap = Sctpmap.fromMap(data['sctpmap']);
-    }
-    if (data['xGoogleFlag'] != null) {
-      xGoogleFlag = data['xGoogleFlag'];
-    }
-    if (data['fingerprint'] != null) {
-      fingerprint = Fingerprint.fromMap(data['fingerprint']);
-    }
-    if (data['rtcpFbTrrInt'] != null) {
-      rtcpFbTrrInt = List<RtcpFbTrrInt>.from((data['rtcpFbTrrInt'] ?? [])
-          .map((rFTI) => RtcpFbTrrInt.fromMap(rFTI))
-          .toList());
-    }
-    if (data['crypto'] != null) {
-      crypto = List<Crypto>.from(
-          (data['crypto'] ?? []).map((c) => Crypto.fromMap(c)).toList());
-    }
-    if (data['invalid'] != null) {
-      invalid = [];
-      for (var i in (data['invalid'] ?? [])) {
-        try {
-          invalid!.add(Invalid.fromMap(i is Map ? i : {'value': i.toString()}));
-        } catch (e) {
-          print('DEBUG: Failed to parse invalid SDP line: $i, error: $e');
-        }
-      }
-    }
-    if (data['ptime'] != null) {
-      ptime = data['ptime'];
-    }
-    if (data['maxptime'] != null) {
-      maxptime = data['maxptime'];
-    }
-    if (data['label'] != null) {
-      label = data['label'];
-    }
-    if (data['bandwidth'] != null) {
-      bandwidth = List<Bandwidth>.from(
-          (data['bandwidth'] ?? []).map((b) => Bandwidth.fromMap(b)).toList());
-    }
-    if (data['framerate'] != null) {
-      framerate = data['framerate'];
-    }
-    if (data['bundleOnly'] != null) {
-      bundleOnly = data['bundleOnly'];
-    }
-    if (data['imageattrs'] != null) {
-      imageattrs = List<Imageattrs>.from((data['imageattrs'] ?? [])
-          .map((ia) => Imageattrs.fromMap(ia))
-          .toList());
-    }
-    if (data['sourceFilter'] != null) {
-      sourceFilter = SourceFilter.fromMap(data['sourceFilter']);
-    }
-    if (data['description'] != null) {
-      description = data['description'];
-    }
-  }
-
-  Map<String, dynamic> toMap() {
-    Map<String, dynamic> result = <String, dynamic>{};
-    if (candidates != null) {
-      result['candidates'] = [
-        candidates!.map((IceCandidate c) => c.toMap()).toList().first
-      ];
-    }
-    if (iceUfrag != null) {
-      result['iceUfrag'] = iceUfrag;
-    }
-    if (icePwd != null) {
-      result['icePwd'] = icePwd;
-    }
-    if (endOfCandidates != null) {
-      result['endOfCandidates'] = endOfCandidates;
-    }
-    if (iceOptions != null) {
-      result['iceOptions'] = iceOptions;
-    }
-    if (setup != null) {
-      result['setup'] = setup;
-    }
-    if (mid != null) {
-      result['mid'] = mid;
-    }
-    if (port != null) {
-      result['port'] = port;
-    }
-    if (direction != null) {
-      result['direction'] = direction!.value;
-    }
-    if (rtp != null) {
-      result['rtp'] = rtp!.map((Rtp r) => r.toMap()).toList();
-    }
-    if (fmtp != null) {
-      result['fmtp'] = fmtp!.map((Fmtp f) => f.toMap()).toList();
-    }
-    if (type != null) {
-      result['type'] = type;
-    }
-    if (protocol != null) {
-      result['protocol'] = protocol;
-    }
-    if (payloads != null) {
-      result['payloads'] = payloads;
-    }
-    if (connection != null) {
-      result['connection'] = connection!.toMap();
-    }
-    if (rtcp != null) {
-      result['rtcp'] = rtcp!.toMap();
-    }
-    if (ext != null) {
-      result['ext'] = ext!.map((Ext e) => e.toMap()).toList();
-    }
-    if (msid != null) {
-      result['msid'] = msid;
-    }
-    if (rtcpMux != null) {
-      result['rtcpMux'] = rtcpMux;
-    }
-    if (rtcpFb != null) {
-      result['rtcpFb'] = rtcpFb!.map((RtcpFb rfb) => rfb.toMap()).toList();
-    }
-    if (ssrcs != null) {
-      result['ssrcs'] = ssrcs?.map((Ssrc s) => s.toMap()).toList();
-    }
-    if (ssrcGroups != null) {
-      result['ssrcGroups'] =
-          ssrcGroups?.map((SsrcGroup sg) => sg.toMap()).toList();
-    }
-    if (simulcast != null) {
-      result['simulcast'] = simulcast!.toMap();
-    }
-    if (simulcast_03 != null) {
-      result['simulcast_03'] = simulcast_03!.toMap();
-    }
-    if (rids != null) {
-      result['rids'] = rids!.map((Rid r) => r.toMap()).toList();
-    }
-    if (extmapAllowMixed != null && extmapAllowMixed == true) {
-      result['extmapAllowMixed'] = extmapAllowMixed;
-    }
-    if (rtcpRsize != null) {
-      result['rtcpRsize'] = rtcpRsize;
-    }
-    if (sctpPort != null) {
-      result['sctpPort'] = sctpPort;
-    }
-    if (maxMessageSize != null) {
-      result['maxMessageSize'] = maxMessageSize;
-    }
-    if (sctpmap != null) {
-      result['sctpmap'] = sctpmap!.toMap();
-    }
-    if (xGoogleFlag != null) {
-      result['xGoogleFlag'] = xGoogleFlag;
-    }
-    if (fingerprint != null) {
-      result['fingerprint'] = fingerprint!.toMap();
-    }
-    if (rtcpFbTrrInt != null) {
-      result['rtcpFbTrrInt'] =
-          rtcpFbTrrInt!.map((RtcpFbTrrInt rFTI) => rFTI.toMap()).toList();
-    }
-    if (crypto != null) {
-      result['crypto'] = crypto!.map((Crypto c) => c.toMap()).toList();
-    }
-    if (invalid != null) {
-      result['invalid'] = invalid!.map((Invalid i) => i.toMap()).toList();
-    }
-    if (ptime != null) {
-      result['ptime'] = ptime;
-    }
-    if (maxptime != null) {
-      result['maxptime'] = maxptime;
-    }
-    if (label != null) {
-      result['label'] = label;
-    }
-    if (bandwidth != null) {
-      result['bandwidth'] =
-          bandwidth!.map((Bandwidth bw) => bw.toMap()).toList();
-    }
-    if (framerate != null) {
-      result['framerate'] = framerate;
-    }
-    if (bundleOnly != null) {
-      result['bundleOnly'] = bundleOnly;
-    }
-    if (imageattrs != null) {
-      result['imageattrs'] =
-          imageattrs!.map((Imageattrs im) => im.toMap()).toList();
-    }
-    if (sourceFilter != null) {
-      result['sourceFilter'] = sourceFilter!.toMap();
-    }
-    if (description != null) {
-      result['description'] = description;
-    }
-
-    return result;
-  }
-}
-
+/// Base class for media sections in SDP
 abstract class MediaSection {
-  late MediaObject _mediaObject;
-  late bool _planB;
-
+  /// The media object (m= line and its attributes) as Map from sdp-transform
+  final Map<String, dynamic> _mediaObject;
+  
+  /// The MID for this media section
+  final String mid;
+  
+  /// The media kind (audio, video, application)
+  final String kind;
+  
+  /// The CNAME for RTCP
+  final String? cname;
+  
+  /// Whether RTX is enabled
+  final bool enableRtx;
+  
+  /// Whether SRTP is enabled
+  final bool enableSrtp;
+  
+  /// Whether SCTP is enabled
+  final bool enableSctp;
+  
+  /// Whether UDP is enabled
+  final bool enableUdp;
+  
+  /// Whether TCP is enabled
+  final bool enableTcp;
+  
+  /// Whether RTCP muxing is enabled
+  final bool enableRtcpMux;
+  
+  /// Whether this is a data channel
+  final bool isDataChannel;
+  
+  /// The media object (m= line and its attributes)
+  Map<String, dynamic> get mediaObject => _mediaObject;
+  
+  /// The media type (audio, video, application)
+  String get mediaType => kind;
+  
+  /// The direction of this media section
+  RtpHeaderDirection get direction;
+  
+  /// Whether this media section is paused
+  bool get isPaused;
+  
+  /// Whether this media section is muted
+  bool get isMuted;
+  
+  /// The RTP parameters for this media section
+  RtpParameters get rtpParameters;
+  
+  /// The codec payload types for this media section
+  Map<String, int> get codecPayloads;
+  
+  /// The extension IDs for this media section
+  Map<String, int> get extIds;
+  
+  /// The RTP capabilities for this media section
+  RtpCapabilities get rtpCapabilities;
+  
+  /// Whether this media section is offering a new DTLS role
+  bool get offerRtpDtlsRole;
+  
+  /// Create a new MediaSection
   MediaSection({
-    IceParameters? iceParameters,
-    List<IceCandidate>? iceCandidates,
-    DtlsParameters? dtlsParameters,
-    required bool planB,
-  }) {
-    _mediaObject = MediaObject();
-    _planB = planB;
-
-    if (iceParameters != null) {
-      setIceParameters(iceParameters);
+    required this.mid,
+    required this.kind,
+    this.cname,
+    this.enableRtx = false,
+    this.enableSrtp = false,
+    this.enableSctp = false,
+    this.enableUdp = true,
+    this.enableTcp = false,
+    this.enableRtcpMux = true,
+    this.isDataChannel = false,
+  }) : _mediaObject = {} {
+    _mediaObject['mid'] = mid;
+    _mediaObject['type'] = kind;
+    _mediaObject['protocol'] = enableSctp 
+        ? 'UDP/DTLS/SCTP' 
+        : enableSrtp 
+            ? 'UDP/TLS/RTP/SAVPF' 
+            : 'RTP/AVP';
+    _mediaObject['port'] = 7; // Default port (will be updated)
+    _mediaObject['connection'] = {'ip': '0.0.0.0', 'version': 4};
+    _mediaObject['direction'] = RtpHeaderDirection.inactive.value;
+    
+    if (enableRtcpMux) {
+      _mediaObject['rtcpMux'] = 'rtcp-mux';
     }
-
-    if (iceCandidates != null) {
-      _mediaObject.candidates = List<IceCandidate>.of(iceCandidates);
-    }
-
-    if (dtlsParameters != null) {
-      setDtlsRole(dtlsParameters.role);
+    
+    if (enableSrtp) {
+      _mediaObject['crypto'] = [];
     }
   }
-
-  MediaSection.fromMap(Map data) {
-    IceParameters iceParameters = IceParameters.fromMap(data['iceParameters']);
-    List<IceCandidate> iceCandidates = [];
-    if (data['iceCandidates'] != null) {
-      iceCandidates.addAll(data['iceCandidates']
-          .map((iceC) => IceCandidate.fromMap(iceC))
-          .toList());
-    }
-
-    _planB = data['planB'] == true;
-
-    _mediaObject = MediaObject(
-      candidates: iceCandidates,
-      iceUfrag: iceParameters.usernameFragment,
-      icePwd: iceParameters.password,
-    );
+  
+  /// Get codec name from MIME type (matches versatica's media_section.ts)
+  static String getCodecName(String mimeType) {
+    return mimeType.split('/')[1].toLowerCase();
   }
-
-  void setIceParameters(IceParameters iceParameters) {
-    _mediaObject.iceUfrag = iceParameters.usernameFragment;
-    _mediaObject.icePwd = iceParameters.password;
-  }
-
-  MediaObject get getObject => _mediaObject;
-
-  void setDtlsRole(DtlsRole role);
-
-  String? get mid =>
-      _mediaObject.mid != null ? _mediaObject.mid.toString() : null;
-
-  bool get closed => _mediaObject.port == 0;
-
-  void disable() {
-    _mediaObject.direction = RtpHeaderDirection.Inactive;
-
-    _mediaObject.ext = null;
-    _mediaObject.ssrcs = null;
-    _mediaObject.ssrcGroups = null;
-    _mediaObject.simulcast = null;
-    _mediaObject.simulcast_03 = null;
-    _mediaObject.rids = null;
-  }
-
+  
+  /// Disable this media section
+  void disable();
+  
+  /// Pause this media section
+  void pause();
+  
+  /// Resume this media section
+  void resume();
+  
+  /// Set the RTP parameters for this media section
+  void setRtpParameters(RtpParameters rtpParameters);
+  
+  /// Set the RTP mapping for this media section
+  void setRtpMapping(Map<String, dynamic> rtpMapping);
+  
+  /// Set the DTLS role for this media section
+  void setDtlsRole(String role);
+  
+  /// Set the DTLS parameters for this media section
+  void setDtlsParameters(Map<String, dynamic> dtlsParameters);
+  
+  /// Set the SCTP parameters for this media section
+  void setSctpParameters(Map<String, dynamic> sctpParameters);
+  
+  /// Set the SCTP stream parameters for this media section
+  void setSctpStreamParameters(List<dynamic> sctpStreamParameters);
+  
+  /// Set the maximum message size for this media section
+  void setMaxMessageSize(int maxMessageSize);
+  
+  /// Get the media section as an object
+  Map<String, dynamic> getObject();
+  
+  /// Close this media section
   void close() {
-    _mediaObject.direction = RtpHeaderDirection.Inactive;
-
-    _mediaObject.port = 0;
-
-    _mediaObject.ext = null;
-    _mediaObject.ssrcs = null;
-    _mediaObject.ssrcGroups = null;
-    _mediaObject.simulcast = null;
-    _mediaObject.simulcast_03 = null;
-    _mediaObject.rids = null;
-    _mediaObject.extmapAllowMixed = null;
+    disable();
+    _mediaObject['port'] = 0;
   }
-}
-
-class AnswerMediaSection extends MediaSection {
-  AnswerMediaSection({
-    required IceParameters iceParameters,
-    required List<IceCandidate> iceCandidates,
-    required DtlsParameters dtlsParameters,
-    bool planB = false,
-    SctpParameters? sctpParameters,
-    PlainRtpParameters? plainRtpParameters,
-    required MediaObject offerMediaObject,
-    RtpParameters? offerRtpParameters,
-    RtpParameters? answerRtpParameters,
-    ProducerCodecOptions? codecOptions,
-    bool extmapAllowMixed = false,
-  }) : super(
-          iceParameters: iceParameters,
-          iceCandidates: iceCandidates,
-          dtlsParameters: dtlsParameters,
-          planB: planB,
-        ) {
-    _mediaObject.mid = offerMediaObject.mid;
-    _mediaObject.type = offerMediaObject.type;
-    _mediaObject.protocol = offerMediaObject.protocol;
-
-    if (plainRtpParameters == null) {
-      _mediaObject.connection = Connection(
-        ip: '127.0.0.1',
-        version: 4,
-      );
-      _mediaObject.port = 7;
-    } else {
-      _mediaObject.connection = Connection(
-        ip: plainRtpParameters.ip,
-        version: plainRtpParameters.ipVersion,
-      );
-      _mediaObject.port = plainRtpParameters.port;
-    }
-
-    switch (offerMediaObject.type) {
-      case 'audio':
-      case 'video':
-        {
-          _mediaObject.direction =
-              RtpHeaderDirectionExtension.fromString('recvonly');
-          _mediaObject.rtp = <Rtp>[];
-          _mediaObject.rtcpFb = <RtcpFb>[];
-          _mediaObject.fmtp = <Fmtp>[];
-
-          for (RtpCodecParameters codec in answerRtpParameters?.codecs ?? []) {
-            Rtp rtp = Rtp(
-              payload: codec.payloadType,
-              codec: getCodecName(codec),
-              rate: codec.clockRate,
-            );
-
-            if (codec.channels != null && codec.channels! > 1) {
-              rtp.encoding = codec.channels;
-            }
-
-            _mediaObject.rtp?.add(rtp);
-
-            // CodecParameters codecParameters =
-            // CodecParameters.copy(codec.parameters);
-            Map<dynamic, dynamic> codecParameters =
-                Map<dynamic, dynamic>.of(codec.parameters);
-
-            if (codecOptions != null) {
-              final int? opusStereo = codecOptions.opusStereo;
-              final int? opusFec = codecOptions.opusFec;
-              final int? opusDtx = codecOptions.opusDtx;
-              final int? opusMaxPlaybackRate = codecOptions.opusMaxPlaybackRate;
-              final int? opusMaxAverageBitrate =
-                  codecOptions.opusMaxAverageBitrate;
-              final int? opusPtime = codecOptions.opusPtime;
-              final int? videoGoogleStartBitrate =
-                  codecOptions.videoGoogleStartBitrate;
-              final int? videoGoogleMaxBitrate =
-                  codecOptions.videoGoogleMaxBitrate;
-              final int? videoGoogleMinBitrate =
-                  codecOptions.videoGoogleMinBitrate;
-
-              final RtpCodecParameters? offerCodec =
-                  offerRtpParameters?.codecs.firstWhere(
-                (RtpCodecParameters c) => c.payloadType == codec.payloadType,
-                orElse: () => null as RtpCodecParameters,
-              );
-
-              switch (codec.mimeType.toLowerCase()) {
-                case 'audio/opus':
-                  {
-                    // if (opusStereo != null) {
-                    // offerCodec.parameters['sprop-stereo'] = opusStereo ? 1 : 0;
-                    offerCodec!.parameters['sprop-stereo'] =
-                        opusStereo != null ? opusStereo : 0;
-                    // codecParameters['stereo'] = opusStereo ? 1 : 0;
-                    codecParameters['stereo'] =
-                        opusStereo != null ? opusStereo : 0;
-                    // }
-
-                    // if (opusFec != null) {
-                    // offerCodec.parameters['useinbandfec'] = opusFec ? 1 : 0;
-                    offerCodec.parameters['useinbandfec'] =
-                        opusFec != null ? opusFec : 0;
-                    // codecParameters['useinbandfec'] = opusFec ? 1 : 0;
-                    codecParameters['useinbandfec'] =
-                        opusFec != null ? opusFec : 0;
-                    // }
-
-                    // if (opusDtx != null) {
-                    // offerCodec.parameters['usedtx'] = opusDtx ? 1 : 0;
-                    offerCodec.parameters['usedtx'] =
-                        opusDtx != null ? opusDtx : 0;
-                    // codecParameters['usedtx'] = opusDtx ? 1 : 0;
-                    codecParameters['usedtx'] = opusDtx != null ? opusDtx : 0;
-                    // }
-
-                    if (opusMaxPlaybackRate != null) {
-                      codecParameters['maxplaybackrate'] = opusMaxPlaybackRate;
-                    }
-
-                    if (opusMaxAverageBitrate != null) {
-                      codecParameters['maxaveragebitrate'] =
-                          opusMaxAverageBitrate;
-                    }
-
-                    if (opusPtime != null) {
-                      offerCodec.parameters['ptime'] = opusPtime;
-                      codecParameters['ptime'] = opusPtime;
-                    }
-
-                    break;
-                  }
-
-                case 'video/vp8':
-                case 'video/vp9':
-                case 'video/h264':
-                case 'video/h265':
-                  {
-                    if (videoGoogleStartBitrate != null) {
-                      codecParameters['x-google-start-bitrate'] =
-                          videoGoogleStartBitrate;
-                    }
-
-                    if (videoGoogleMaxBitrate != null) {
-                      codecParameters['x-google-max-bitrate'] =
-                          videoGoogleMaxBitrate;
-                    }
-
-                    if (videoGoogleMinBitrate != null) {
-                      codecParameters['x-google-min-bitrate'] =
-                          videoGoogleMinBitrate;
-                    }
-                    break;
-                  }
-              }
-            }
-
-            Fmtp fmtp = Fmtp(
-              payload: codec.payloadType,
-              config: '',
-            );
-
-            for (String key in codecParameters.keys) {
-              if (fmtp.config.isNotEmpty) {
-                fmtp.config += ';';
-              }
-
-              fmtp.config += '$key=${codecParameters[key]}';
-            }
-
-            if (fmtp.config.isNotEmpty) {
-              _mediaObject.fmtp!.add(fmtp);
-            }
-
-            for (RtcpFeedback fb in codec.rtcpFeedback) {
-              _mediaObject.rtcpFb!.add(RtcpFb(
-                payload: codec.payloadType,
-                type: fb.type,
-                subtype: fb.parameter,
-              ));
-            }
-          }
-
-          _mediaObject.payloads = answerRtpParameters?.codecs
-              .map((RtpCodecParameters codec) => codec.payloadType)
-              .toList()
-              .join(' ');
-
-          _mediaObject.ext = <Ext>[];
-
-          for (RtpHeaderExtensionParameters ext
-              in answerRtpParameters?.headerExtensions ?? []) {
-            // Don't add a header extension if not present in the offer.
-            bool found = (offerMediaObject.ext ?? [])
-                .any((Ext localExt) => localExt.uri == ext.uri);
-
-            if (!found) {
-              continue;
-            }
-
-            _mediaObject.ext!.add(Ext(
-              uri: ext.uri,
-              value: ext.id,
-            ));
-          }
-
-          // Allow both 1 byte and 2 bytes length header extensions.
-          if (extmapAllowMixed == true &&
-              offerMediaObject.extmapAllowMixed == true) {
-            _mediaObject.extmapAllowMixed = true;
-          }
-
-          // Simulcast.
-          if (offerMediaObject.simulcast != null) {
-            _mediaObject.simulcast = Simulcast(
-              dir1: 'recv',
-              list1: offerMediaObject.simulcast?.list1,
-            );
-
-            _mediaObject.rids = <Rid>[];
-
-            for (Rid rid in offerMediaObject.rids ?? []) {
-              if (rid.direction != 'send') {
-                continue;
-              }
-
-              _mediaObject.rids!.add(Rid(
-                id: rid.id,
-                direction: 'recv',
-              ));
-            }
-          } else if (offerMediaObject.simulcast_03 != null) {
-            // Simulcast (draft version 03).
-            _mediaObject.simulcast_03 = Simulcast_03(
-              value: offerMediaObject.simulcast_03!.value
-                  .replaceAll(RegExp(r'/send/g'), 'recv'),
-            );
-
-            _mediaObject.rids = <Rid>[];
-
-            for (Rid rid in offerMediaObject.rids ?? []) {
-              if (rid.direction != 'send') {
-                continue;
-              }
-
-              _mediaObject.rids!.add(Rid(
-                id: rid.id,
-                direction: 'recv',
-              ));
-            }
-          }
-
-          _mediaObject.rtcpMux = 'rtcp-mux';
-          _mediaObject.rtcpRsize = 'rtcp-rsize';
-
-          if (_planB && _mediaObject.type == 'video') {
-            _mediaObject.xGoogleFlag = 'conference';
-          }
-          break;
-        }
-
-      case 'application':
-        {
-          // New spec.
-          if (offerMediaObject.sctpPort is int) {
-            _mediaObject.payloads = 'webrtc-datachannel';
-            _mediaObject.sctpPort = sctpParameters?.port;
-            _mediaObject.maxMessageSize = sctpParameters?.maxMessageSize;
-          } else if (offerMediaObject.sctpmap != null) {
-            // Old spec.
-            _mediaObject.payloads = sctpParameters?.port.toString();
-            _mediaObject.sctpmap = Sctpmap(
-              app: 'webrtc-datachannel',
-              sctpmanNumber: sctpParameters!.port,
-              maxMessageSize: sctpParameters.maxMessageSize,
-            );
-          }
-
-          break;
-        }
-    }
-  }
-
+  
+  /// Set the direction of this media section
+  void setDirection(RtpHeaderDirection direction);
+  
   @override
-  void setDtlsRole(DtlsRole role) {
-    switch (role) {
-      case DtlsRole.client:
-        {
-          _mediaObject.setup = 'active';
-          break;
-        }
-      case DtlsRole.server:
-        {
-          _mediaObject.setup = 'passive';
-          break;
-        }
-      case DtlsRole.auto:
-        {
-          _mediaObject.setup = 'actpass';
-          break;
-        }
-    }
+  String toString() {
+    return 'MediaSection(mid: $mid, kind: $kind, direction: $direction)';
   }
 }
 
+/// Media section for offers
 class OfferMediaSection extends MediaSection {
+  @override
+  final RtpParameters rtpParameters;
+  
+  @override
+  final Map<String, int> codecPayloads;
+  
+  @override
+  final Map<String, int> extIds;
+  
+  @override
+  final RtpCapabilities rtpCapabilities;
+  
+  @override
+  RtpHeaderDirection direction;
+  
+  @override
+  final bool offerRtpDtlsRole;
+  
   OfferMediaSection({
-    required IceParameters iceParameters,
-    required List<IceCandidate> iceCandidates,
-    required DtlsParameters dtlsParameters,
-    SctpParameters? sctpParameters,
-    PlainRtpParameters? plainRtpParameters,
-    bool planB = false,
     required String mid,
     required String kind,
-    RtpParameters? offerRtpParameters,
-    String? streamId,
-    String? trackId,
-    bool oldDataChannelSpec = false,
+    required this.rtpParameters,
+    required this.codecPayloads,
+    required this.extIds,
+    required this.rtpCapabilities,
+    this.direction = RtpHeaderDirection.sendrecv,
+    this.offerRtpDtlsRole = false,
+    String? cname,
+    bool enableRtx = false,
+    bool enableSrtp = false,
+    bool enableSctp = false,
+    bool enableUdp = true,
+    bool enableTcp = false,
+    bool enableRtcpMux = true,
+    bool isDataChannel = false,
   }) : super(
-          planB: planB,
-          dtlsParameters: dtlsParameters,
-          iceCandidates: iceCandidates,
-          iceParameters: iceParameters,
+          mid: mid,
+          kind: kind,
+          cname: cname,
+          enableRtx: enableRtx,
+          enableSrtp: enableSrtp,
+          enableSctp: enableSctp,
+          enableUdp: enableUdp,
+          enableTcp: enableTcp,
+          enableRtcpMux: enableRtcpMux,
+          isDataChannel: isDataChannel,
         ) {
-    _mediaObject.mid = mid;
-    _mediaObject.type = kind;
-
-    if (plainRtpParameters == null) {
-      _mediaObject.connection = Connection(
-        ip: '127.0.0.1',
-        version: 4,
-      );
-
-      if (sctpParameters == null) {
-        _mediaObject.protocol = 'UDP/TLS/RTP/SAVPF';
-      } else {
-        _mediaObject.protocol = 'UDP/DTLS/SCTP';
-      }
-
-      _mediaObject.port = 7;
-    } else {
-      _mediaObject.connection = Connection(
-        ip: plainRtpParameters.ip,
-        version: plainRtpParameters.ipVersion,
-      );
-      _mediaObject.protocol = 'RTP/AVP';
-      _mediaObject.port = plainRtpParameters.port;
-    }
-
-    switch (kind) {
-      case 'audio':
-      case 'video':
-        {
-          _mediaObject.direction =
-              RtpHeaderDirectionExtension.fromString('sendonly');
-          _mediaObject.rtp = <Rtp>[];
-          _mediaObject.rtcpFb = <RtcpFb>[];
-          _mediaObject.fmtp = <Fmtp>[];
-
-          if (!_planB) {
-            _mediaObject.msid = '${streamId ?? '-'} $trackId';
-          }
-
-          for (RtpCodecParameters codec in offerRtpParameters?.codecs ?? []) {
-            Rtp rtp = Rtp(
-              payload: codec.payloadType,
-              codec: getCodecName(codec),
-              rate: codec.clockRate,
-            );
-
-            if (codec.channels != null && codec.channels! > 1) {
-              rtp.encoding = codec.channels;
-            }
-
-            _mediaObject.rtp!.add(rtp);
-
-            Fmtp fmtp = Fmtp(
-              payload: codec.payloadType,
-              config: '',
-            );
-
-            for (String key in codec.parameters.keys) {
-              if (fmtp.config.isNotEmpty) {
-                fmtp.config += ';';
-              }
-
-              fmtp.config += '$key=${codec.parameters[key]}';
-            }
-
-            if (fmtp.config.isNotEmpty) {
-              _mediaObject.fmtp!.add(fmtp);
-            }
-
-            for (RtcpFeedback fb in codec.rtcpFeedback) {
-              _mediaObject.rtcpFb!.add(RtcpFb(
-                  payload: codec.payloadType,
-                  type: fb.type,
-                  subtype: fb.parameter));
-            }
-          }
-
-          _mediaObject.payloads = offerRtpParameters?.codecs
-              .map((RtpCodecParameters codec) => codec.payloadType)
-              .toList()
-              .join(' ');
-
-          _mediaObject.ext = <Ext>[];
-
-          for (RtpHeaderExtensionParameters ext
-              in offerRtpParameters?.headerExtensions ?? []) {
-            _mediaObject.ext!.add(Ext(
-              uri: ext.uri,
-              value: ext.id,
-            ));
-          }
-
-          _mediaObject.rtcpMux = 'rtcp-mux';
-          _mediaObject.rtcpRsize = 'rtcp-rsize';
-
-          // Ensure offerRtpParameters and encodings are valid
-          if (offerRtpParameters == null ||
-              offerRtpParameters.encodings.isEmpty) {
-            print(
-                'DEBUG: OfferMediaSection: No offerRtpParameters or encodings, using fallback');
-            offerRtpParameters = RtpParameters(
-              encodings: [
-                RtpEncodingParameters(
-                  ssrc: Random().nextInt(4294967295),
-                  maxBitrate: 5000000,
-                ),
-              ],
-              rtcp: RtcpParameters(cname: 'cname-${Random().nextInt(1000000)}'),
-            );
-          }
-
-          RtpEncodingParameters encoding = offerRtpParameters.encodings.first;
-          int ssrc =
-              encoding.ssrc ?? Random().nextInt(4294967295); // Fallback SSRC
-          int? rtxSsrc = (encoding.rtx != null && encoding.rtx!.ssrc != null)
-              ? encoding.rtx!.ssrc
-              : null;
-
-          print(
-              'DEBUG: OfferMediaSection: Using SSRC=$ssrc, RTX SSRC=$rtxSsrc');
-
-          // Ensure rtcp.cname is set
-          if (offerRtpParameters.rtcp == null ||
-              offerRtpParameters.rtcp!.cname?.isNotEmpty != true) {
-            print(
-                'DEBUG: OfferMediaSection: No valid rtcp.cname, using fallback');
-            offerRtpParameters.rtcp =
-                RtcpParameters(cname: 'cname-${Random().nextInt(1000000)}');
-          }
-
-          _mediaObject.ssrcs = <Ssrc>[];
-          _mediaObject.ssrcGroups = [];
-
-          if (offerRtpParameters.rtcp?.cname?.isNotEmpty == true) {
-            _mediaObject.ssrcs!.add(Ssrc(
-              id: ssrc,
-              attribute: 'cname',
-              value: offerRtpParameters.rtcp!.cname!,
-            ));
-            print(
-                'DEBUG: OfferMediaSection: Added cname SSRC: id=$ssrc, cname=${offerRtpParameters.rtcp!.cname}');
-          }
-
-          if (_planB) {
-            _mediaObject.ssrcs!.add(Ssrc(
-              id: ssrc,
-              attribute: 'msid',
-              value: '${streamId ?? '-'} $trackId',
-            ));
-            print(
-                'DEBUG: OfferMediaSection: Added msid SSRC: id=$ssrc, msid=${streamId ?? '-'} $trackId');
-          }
-
-          if (rtxSsrc != null) {
-            if (offerRtpParameters.rtcp?.cname?.isNotEmpty == true) {
-              _mediaObject.ssrcs!.add(Ssrc(
-                id: rtxSsrc,
-                attribute: 'cname',
-                value: offerRtpParameters.rtcp!.cname!,
-              ));
-              print(
-                  'DEBUG: OfferMediaSection: Added RTX cname SSRC: id=$rtxSsrc, cname=${offerRtpParameters.rtcp!.cname}');
-            }
-
-            if (_planB) {
-              _mediaObject.ssrcs!.add(Ssrc(
-                id: rtxSsrc,
-                attribute: 'msid',
-                value: '${streamId ?? '-'} $trackId',
-              ));
-              print(
-                  'DEBUG: OfferMediaSection: Added RTX msid SSRC: id=$rtxSsrc, msid=${streamId ?? '-'} $trackId');
-            }
-
-            // Associate original and retransmission SSRCs.
-            _mediaObject.ssrcGroups!.add(SsrcGroup(
-              semantics: 'FID',
-              ssrcs: [ssrc, rtxSsrc],
-            ));
-            print(
-                'DEBUG: OfferMediaSection: Added FID group: ssrc=$ssrc, rtxSsrc=$rtxSsrc');
-          }
-          break;
-        }
-
-      case 'application':
-        {
-          // New spec.
-          if (!oldDataChannelSpec) {
-            _mediaObject.payloads = 'webrtc-datachannel';
-            _mediaObject.sctpPort = sctpParameters?.port;
-            _mediaObject.maxMessageSize = sctpParameters?.maxMessageSize;
-          } else {
-            _mediaObject.payloads = sctpParameters?.port.toString();
-            _mediaObject.sctpmap = Sctpmap(
-              app: 'webrtc-datachannel',
-              sctpmanNumber: sctpParameters!.port,
-              maxMessageSize: sctpParameters.maxMessageSize,
-            );
-          }
-
-          break;
-        }
-    }
+    // Initialize media object
+    _mediaObject['direction'] = direction.value;
   }
-
-  OfferMediaSection.fromMap(Map data) : super.fromMap(data) {
-    _mediaObject = MediaObject.fromMap(data);
-  }
-
+  
   @override
-  void setDtlsRole(DtlsRole role) {
-    // Always 'actpass'. ╾━╤デ╦︻(▀̿Ĺ̯▀̿ ̿)
-    _mediaObject.setup = 'actpass';
+  bool get isPaused => direction == RtpHeaderDirection.inactive;
+  
+  @override
+  bool get isMuted => direction == RtpHeaderDirection.inactive;
+  
+  @override
+  void disable() {
+    direction = RtpHeaderDirection.inactive;
+    _mediaObject['direction'] = direction.value;
   }
-
-  void planBReceive({
-    required RtpParameters offerRtpParameters,
-    String? streamId,
-    required String trackId,
-  }) {
-    print('DEBUG: planBReceive: ssrc=${offerRtpParameters.encodings.isNotEmpty ? offerRtpParameters.encodings.first.ssrc : 'none'}, rtxSsrc=${offerRtpParameters.encodings.isNotEmpty && offerRtpParameters.encodings.first.rtx != null ? offerRtpParameters.encodings.first.rtx!.ssrc : 'none'}, streamId=$streamId, trackId=$trackId');
-    
-    if (offerRtpParameters.encodings.isEmpty) {
-      print('DEBUG: planBReceive: No encodings, adding fallback');
-      offerRtpParameters.encodings = [
-        RtpEncodingParameters(
-          ssrc: Random().nextInt(4294967295),
-          maxBitrate: 5000000,
-        ),
-      ];
+  
+  @override
+  void pause() {
+    if (direction == RtpHeaderDirection.sendrecv) {
+      direction = RtpHeaderDirection.recvonly;
+    } else if (direction == RtpHeaderDirection.sendonly) {
+      direction = RtpHeaderDirection.inactive;
     }
-
-    RtpEncodingParameters encoding = offerRtpParameters.encodings.first;
-    int ssrc = encoding.ssrc ?? Random().nextInt(4294967295);
-    int? rtxSsrc = (encoding.rtx != null && encoding.rtx?.ssrc != null)
-        ? encoding.rtx!.ssrc
-        : null;
-
-    print('DEBUG: planBReceive: Using SSRC=$ssrc, RTX SSRC=$rtxSsrc');
-
-    // Initialize collections if needed
-    _mediaObject.ssrcs ??= <Ssrc>[];
-    _mediaObject.ssrcGroups ??= <SsrcGroup>[];
-
-    // Add cname SSRC
-    if (offerRtpParameters.rtcp?.cname?.isNotEmpty == true) {
-      _mediaObject.ssrcs!.add(Ssrc(
-        id: ssrc,
-        attribute: 'cname',
-        value: offerRtpParameters.rtcp!.cname!,
-      ));
-      print(
-          'DEBUG: planBReceive: Added cname SSRC: id=$ssrc, cname=${offerRtpParameters.rtcp!.cname}');
-    } else {
-      print('DEBUG: planBReceive: No valid cname, using fallback');
-      _mediaObject.ssrcs!.add(Ssrc(
-        id: ssrc,
-        attribute: 'cname',
-        value: 'cname-${Random().nextInt(1000000)}',
-      ));
-    }
-
-    // Add msid SSRC
-    _mediaObject.ssrcs!.add(Ssrc(
-      id: ssrc,
-      attribute: 'msid',
-      value: '${streamId ?? '-'} $trackId',
-    ));
-    print(
-        'DEBUG: planBReceive: Added msid SSRC: id=$ssrc, msid=${streamId ?? '-'} $trackId');
-
-    // Handle RTX SSRC if present
-    if (rtxSsrc != null) {
-      // Add RTX cname SSRC
-      if (offerRtpParameters.rtcp?.cname?.isNotEmpty == true) {
-        _mediaObject.ssrcs!.add(Ssrc(
-          id: rtxSsrc,
-          attribute: 'cname',
-          value: offerRtpParameters.rtcp!.cname!,
-        ));
-        print(
-            'DEBUG: planBReceive: Added RTX cname SSRC: id=$rtxSsrc, cname=${offerRtpParameters.rtcp!.cname}');
-      } else {
-        print('DEBUG: planBReceive: No valid RTX cname, using fallback');
-        _mediaObject.ssrcs!.add(Ssrc(
-          id: rtxSsrc,
-          attribute: 'cname',
-          value: 'cname-${Random().nextInt(1000000)}',
-        ));
-      }
-
-      // Add RTX msid SSRC
-      _mediaObject.ssrcs!.add(Ssrc(
-        id: rtxSsrc,
-        attribute: 'msid',
-        value: '${streamId ?? '-'} $trackId',
-      ));
-      print(
-          'DEBUG: planBReceive: Added RTX msid SSRC: id=$rtxSsrc, msid=${streamId ?? '-'} $trackId');
-
-      // Add FID group for original and RTX SSRCs
-      _mediaObject.ssrcGroups!.add(SsrcGroup(
-        semantics: 'FID',
-        ssrcs: [ssrc, rtxSsrc],
-      ));
-      print(
-          'DEBUG: planBReceive: Added FID group: ssrc=$ssrc, rtxSsrc=$rtxSsrc');
-    }
+    _mediaObject['direction'] = direction.value;
   }
-
-  void planBStopReceiving({
-    required RtpParameters offerRtpParameters,
-  }) {
-    if (offerRtpParameters.encodings.isEmpty) {
-      print('DEBUG: planBStopReceiving: No encodings provided');
-      return;
+  
+  @override
+  void resume() {
+    if (direction == RtpHeaderDirection.recvonly) {
+      direction = RtpHeaderDirection.sendrecv;
+    } else if (direction == RtpHeaderDirection.inactive) {
+      direction = RtpHeaderDirection.sendonly;
     }
-
-    // Ensure collections are initialized
-    _mediaObject.ssrcs ??= <Ssrc>[];
-    _mediaObject.ssrcGroups ??= <SsrcGroup>[];
-
-    RtpEncodingParameters encoding = offerRtpParameters.encodings.first;
-    int ssrc = encoding.ssrc ?? Random().nextInt(4294967295); // Fallback SSRC
-    int? rtxSsrc = (encoding.rtx != null && encoding.rtx?.ssrc != null)
-        ? encoding.rtx!.ssrc
-        : null;
-
-    print('DEBUG: planBStopReceiving: Removing SSRC=$ssrc, RTX SSRC=$rtxSsrc');
-
-    // Remove SSRCs matching the given SSRC or RTX SSRC
-    if (_mediaObject.ssrcs != null) {
-      _mediaObject.ssrcs = _mediaObject.ssrcs!
-          .where(
-              (Ssrc s) => s.id != ssrc && (rtxSsrc == null || s.id != rtxSsrc))
-          .toList();
-    }
-
-    // Remove SSRC groups containing the given SSRC or RTX SSRC
-    if (rtxSsrc != null && _mediaObject.ssrcGroups != null) {
-      _mediaObject.ssrcGroups = _mediaObject.ssrcGroups!
-          .where((SsrcGroup group) =>
-              !group.ssrcs.contains(ssrc) && !group.ssrcs.contains(rtxSsrc))
-          .toList();
-    }
-
-    print(
-        'DEBUG: planBStopReceiving: Removed SSRCs: ssrc=$ssrc, rtxSsrc=$rtxSsrc');
+    _mediaObject['direction'] = direction.value;
+  }
+  
+  @override
+  void setRtpParameters(RtpParameters rtpParameters) {
+    // No-op in base class
+  }
+  
+  @override
+  void setRtpMapping(Map<String, dynamic> rtpMapping) {
+    // No-op in base class
+  }
+  
+  @override
+  void setDtlsRole(String role) {
+    _mediaObject['setup'] = role == 'client' ? 'active' : 'passive';
+  }
+  
+  @override
+  void setDtlsParameters(Map<String, dynamic> dtlsParameters) {
+    _mediaObject['fingerprint'] = {
+      'type': dtlsParameters['fingerprint']['algorithm'],
+      'hash': dtlsParameters['fingerprint']['value'],
+    };
+    _mediaObject['setup'] = dtlsParameters['role'] == 'client' ? 'active' : 'passive';
+  }
+  
+  @override
+  void setSctpParameters(Map<String, dynamic> sctpParameters) {
+    _mediaObject['sctp'] = {
+      'port': sctpParameters['port'],
+      'protocol': sctpParameters['protocol'] ?? 'webrtc-datachannel',
+      'streams': sctpParameters['streams'] ?? 65535,
+    };
+  }
+  
+  @override
+  void setSctpStreamParameters(List<dynamic> sctpStreamParameters) {
+    // No-op in base class
+  }
+  
+  @override
+  void setMaxMessageSize(int maxMessageSize) {
+    _mediaObject['maxMessageSize'] = maxMessageSize;
+  }
+  
+  @override
+  Map<String, dynamic> getObject() {
+    return {
+      'mid': mid,
+      'kind': kind,
+      'rtpParameters': rtpParameters.toMap(),
+      'rtpCapabilities': rtpCapabilities.toMap(),
+      'direction': direction.toString().split('.').last,
+      'offerRtpDtlsRole': offerRtpDtlsRole,
+      'cname': cname,
+      'enableRtx': enableRtx,
+      'enableSrtp': enableSrtp,
+      'enableSctp': enableSctp,
+      'enableUdp': enableUdp,
+      'enableTcp': enableTcp,
+      'enableRtcpMux': enableRtcpMux,
+      'isDataChannel': isDataChannel,
+    };
+  }
+  
+  @override
+  void setDirection(RtpHeaderDirection direction) {
+    this.direction = direction;
+    _mediaObject['direction'] = direction.value;
   }
 }
+
+/// Media section for answers
+class AnswerMediaSection extends MediaSection {
+  @override
+  final RtpParameters rtpParameters;
+  
+  @override
+  final Map<String, int> codecPayloads;
+  
+  @override
+  final Map<String, int> extIds;
+  
+  @override
+  final RtpCapabilities rtpCapabilities;
+  
+  @override
+  RtpHeaderDirection direction;
+  
+  @override
+  final bool offerRtpDtlsRole;
+  
+  AnswerMediaSection({
+    required String mid,
+    required String kind,
+    required this.rtpParameters,
+    required this.codecPayloads,
+    required this.extIds,
+    required this.rtpCapabilities,
+    this.direction = RtpHeaderDirection.sendrecv,
+    this.offerRtpDtlsRole = false,
+    String? cname,
+    bool enableRtx = false,
+    bool enableSrtp = false,
+    bool enableSctp = false,
+    bool enableUdp = true,
+    bool enableTcp = false,
+    bool enableRtcpMux = true,
+    bool isDataChannel = false,
+  }) : super(
+          mid: mid,
+          kind: kind,
+          cname: cname,
+          enableRtx: enableRtx,
+          enableSrtp: enableSrtp,
+          enableSctp: enableSctp,
+          enableUdp: enableUdp,
+          enableTcp: enableTcp,
+          enableRtcpMux: enableRtcpMux,
+          isDataChannel: isDataChannel,
+        ) {
+    // Initialize media object
+    _mediaObject['direction'] = direction.value;
+  }
+  
+  @override
+  bool get isPaused => direction == RtpHeaderDirection.inactive;
+  
+  @override
+  bool get isMuted => direction == RtpHeaderDirection.inactive;
+  
+  @override
+  void disable() {
+    direction = RtpHeaderDirection.inactive;
+    _mediaObject['direction'] = direction.value;
+  }
+  
+  @override
+  void pause() {
+    if (direction == RtpHeaderDirection.sendrecv) {
+      direction = RtpHeaderDirection.recvonly;
+    } else if (direction == RtpHeaderDirection.sendonly) {
+      direction = RtpHeaderDirection.inactive;
+    }
+    _mediaObject['direction'] = direction.value;
+  }
+  
+  @override
+  void resume() {
+    if (direction == RtpHeaderDirection.recvonly) {
+      direction = RtpHeaderDirection.sendrecv;
+    } else if (direction == RtpHeaderDirection.inactive) {
+      direction = RtpHeaderDirection.sendonly;
+    }
+    _mediaObject['direction'] = direction.value;
+  }
+  
+  @override
+  void setRtpParameters(RtpParameters rtpParameters) {
+    // No-op in answer
+  }
+  
+  @override
+  void setRtpMapping(Map<String, dynamic> rtpMapping) {
+    // No-op in answer
+  }
+  
+  @override
+  void setDtlsRole(String role) {
+    _mediaObject['setup'] = role == 'client' ? 'active' : 'passive';
+  }
+  
+  @override
+  void setDtlsParameters(Map<String, dynamic> dtlsParameters) {
+    _mediaObject['fingerprint'] = {
+      'type': dtlsParameters['fingerprint']['algorithm'],
+      'hash': dtlsParameters['fingerprint']['value'],
+    };
+    _mediaObject['setup'] = dtlsParameters['role'] == 'client' ? 'active' : 'passive';
+  }
+  
+  @override
+  void setSctpParameters(Map<String, dynamic> sctpParameters) {
+    _mediaObject['sctp'] = {
+      'port': sctpParameters['port'],
+      'protocol': sctpParameters['protocol'] ?? 'webrtc-datachannel',
+      'streams': sctpParameters['streams'] ?? 65535,
+    };
+  }
+  
+  @override
+  void setSctpStreamParameters(List<dynamic> sctpStreamParameters) {
+    // No-op in answer
+  }
+  
+  @override
+  void setMaxMessageSize(int maxMessageSize) {
+    _mediaObject['maxMessageSize'] = maxMessageSize;
+  }
+  
+  @override
+  Map<String, dynamic> getObject() {
+    return {
+      'mid': mid,
+      'kind': kind,
+      'rtpParameters': rtpParameters.toMap(),
+      'rtpCapabilities': rtpCapabilities.toMap(),
+      'direction': direction.toString().split('.').last,
+      'offerRtpDtlsRole': offerRtpDtlsRole,
+      'cname': cname,
+      'enableRtx': enableRtx,
+      'enableSrtp': enableSrtp,
+      'enableSctp': enableSctp,
+      'enableUdp': enableUdp,
+      'enableTcp': enableTcp,
+      'enableRtcpMux': enableRtcpMux,
+      'isDataChannel': isDataChannel,
+    };
+  }
+  
+  @override
+  void setDirection(RtpHeaderDirection direction) {
+    this.direction = direction;
+    _mediaObject['direction'] = direction.value;
+  }
+}
+
+/// Helper class to create media sections
+class MediaSectionFactory {
+  /// Create a new media section
+  /// Aligns with mediasoup-client v3's createMediaSection
+  static MediaSection create({
+    required String mid,
+    required String kind,
+    required RtpParameters rtpParameters,
+    required Map<String, int> codecPayloads,
+    required Map<String, int> extIds,
+    required RtpCapabilities rtpCapabilities,
+    RtpHeaderDirection direction = RtpHeaderDirection.sendrecv,
+    bool offerRtpDtlsRole = false,
+    String? cname,
+    bool enableRtx = false,
+    bool enableSrtp = false,
+    bool enableSctp = false,
+    bool enableUdp = true,
+    bool enableTcp = false,
+    bool enableRtcpMux = true,
+    bool isDataChannel = false,
+    bool isAnswer = false,
+  }) {
+    // Validate input parameters
+    if (mid.isEmpty) {
+      throw 'missing mid';
+    }
+    if (kind != 'audio' && kind != 'video' && kind != 'application') {
+      throw 'invalid kind: $kind';
+    }
+
+    // Create the appropriate media section based on whether it's an answer or offer
+    if (isAnswer) {
+      return AnswerMediaSection(
+        mid: mid,
+        kind: kind,
+        rtpParameters: rtpParameters,
+        codecPayloads: codecPayloads,
+        extIds: extIds,
+        rtpCapabilities: rtpCapabilities,
+        direction: direction,
+        offerRtpDtlsRole: offerRtpDtlsRole,
+        cname: cname,
+        enableRtx: enableRtx,
+        enableSrtp: enableSrtp,
+        enableSctp: enableSctp,
+        enableUdp: enableUdp,
+        enableTcp: enableTcp,
+        enableRtcpMux: enableRtcpMux,
+        isDataChannel: isDataChannel,
+      );
+    } else {
+      return OfferMediaSection(
+        mid: mid,
+        kind: kind,
+        rtpParameters: rtpParameters,
+        codecPayloads: codecPayloads,
+        extIds: extIds,
+        rtpCapabilities: rtpCapabilities,
+        direction: direction,
+        offerRtpDtlsRole: offerRtpDtlsRole,
+        cname: cname,
+        enableRtx: enableRtx,
+        enableSrtp: enableSrtp,
+        enableSctp: enableSctp,
+        enableUdp: enableUdp,
+        enableTcp: enableTcp,
+        enableRtcpMux: enableRtcpMux,
+        isDataChannel: isDataChannel,
+      );
+    }
+  }
+}
+
+ 

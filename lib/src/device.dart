@@ -6,6 +6,7 @@ import 'package:mediasoup_client_flutter/src/transport.dart';
 import 'package:mediasoup_client_flutter/src/common/enhanced_event_emitter.dart';
 import 'package:mediasoup_client_flutter/src/common/logger.dart';
 import 'package:mediasoup_client_flutter/src/handlers/handler_interface.dart';
+import 'package:mediasoup_client_flutter/src/type_conversion.dart';
 
 Logger _logger = Logger('Device');
 
@@ -92,9 +93,11 @@ class Device {
       // Check wether we can produce audio/video.
       _canProduceByKind = CanProduceByKind(
         audio: Ortc.canSend(
-            RTCRtpMediaType.RTCRtpMediaTypeAudio, _extendedRtpCapabilities!),
+            TypeConversion.rtcToMediaKind(RTCRtpMediaType.RTCRtpMediaTypeAudio), 
+            _extendedRtpCapabilities!),
         video: Ortc.canSend(
-            RTCRtpMediaType.RTCRtpMediaTypeVideo, _extendedRtpCapabilities!),
+            TypeConversion.rtcToMediaKind(RTCRtpMediaType.RTCRtpMediaTypeVideo), 
+            _extendedRtpCapabilities!),
       );
 
       // Generate our receiving RTP capabilities for receiving media.
@@ -102,7 +105,9 @@ class Device {
           Ortc.getRecvRtpCapabilities(_extendedRtpCapabilities!);
 
       // This may throw.
-      Ortc.validateRtpCapabilities(_recvRtpCapabilities);
+      if (_recvRtpCapabilities != null) {
+        Ortc.validateRtpCapabilities(_recvRtpCapabilities!);
+      }
 
       _logger.debug(
           'load() | got receiving RTP capabilities:$_recvRtpCapabilities');
@@ -111,9 +116,6 @@ class Device {
       _sctpCapabilities = handler.getNativeSctpCapabilities();
 
       _logger.debug('load() | got native SCTP capabilities:$_sctpCapabilities');
-
-      // This may throw.
-      Ortc.validateSctpCapabilities(_sctpCapabilities);
 
       _logger.debug('load() successed');
 
@@ -129,15 +131,6 @@ class Device {
     }
   }
 
-  // /// Create a new Device to connect to mediasoup server.
-  // ///
-  // /// @throws {UnsupportedError} if device is not supported.
-  // Device() {
-  //   logger.debug('constructor()');
-
-  //   //
-  // }
-
   /// Whether we can produce audio/video.
   ///
   /// @throws {InvalidStateError} if not loaded.
@@ -147,7 +140,7 @@ class Device {
       throw ('not loaded');
     } else if (kind != RTCRtpMediaType.RTCRtpMediaTypeAudio &&
         kind != RTCRtpMediaType.RTCRtpMediaTypeVideo) {
-      throw ('invalid kind ${RTCRtpMediaTypeExtension.value(kind)}');
+      throw ('invalid kind ${TypeConversion.rtcMediaTypeToString(kind)}');
     }
 
     return _canProduceByKind!.canIt(kind);
@@ -173,15 +166,17 @@ class Device {
     if (!_loaded) {
       throw ('not loaded');
     }
-    // else if (id == null) {
-    //   throw ('missing id');
-    // } else if (iceParameters == null) {
-    //   throw ('missing iceParameters');
-    // } else if (iceCandidates == null) {
-    //   throw ('missing iceCandidates');
-    // } else if (dtlsParameters == null) {
-    //   throw ('missing dtlsParameters');
-    // }
+
+    // Create sending RTP parameters for audio and video
+    final audioSendingRtpParameters = Ortc.getSendingRtpParameters(
+      TypeConversion.rtcToMediaKind(RTCRtpMediaType.RTCRtpMediaTypeAudio), 
+      _extendedRtpCapabilities!,
+    );
+
+    final videoSendingRtpParameters = Ortc.getSendingRtpParameters(
+      TypeConversion.rtcToMediaKind(RTCRtpMediaType.RTCRtpMediaTypeVideo), 
+      _extendedRtpCapabilities!,
+    );
 
     // Create a new Transport.
     Transport transport = Transport(

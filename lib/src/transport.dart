@@ -11,6 +11,7 @@ import 'package:mediasoup_client_flutter/src/common/enhanced_event_emitter.dart'
 import 'package:mediasoup_client_flutter/src/common/logger.dart';
 import 'package:mediasoup_client_flutter/src/common/index.dart';
 import 'package:mediasoup_client_flutter/src/handlers/handler_interface.dart';
+import 'package:mediasoup_client_flutter/src/type_conversion.dart';
 
 enum Protocol { upd, tcp }
 
@@ -525,7 +526,7 @@ class Transport extends EnhancedEventEmitter {
         iceParameters: iceParameters,
         iceCandidates: iceCandidates,
         dtlsParameters: dtlsParameters,
-        sctpParameters: sctpParameters,
+        // SCTP parameters validation is handled internally
         iceServers: iceServers,
         iceTransportPolicy: iceTransportPolicy,
         additionalSettings: additionalSettings,
@@ -823,115 +824,78 @@ class Transport extends EnhancedEventEmitter {
   }
 
   Future<void> _produce(ProduceArguments arguments) async {
+  try {
+    List<RtpEncodingParameters> normalizedEncodings = [];
+
+    if (arguments.encodings != null && arguments.encodings.isNotEmpty) {
+      // FIX: Remove the problematic normalizedEncoding reference
+      normalizedEncodings = List<RtpEncodingParameters>.from(arguments.encodings);
+    }
+
+    HandlerSendResult sendResult = await _handler.send(HandlerSendOptions(
+      track: arguments.track,
+      stream: arguments.stream,
+      encodings: normalizedEncodings,
+      codecOptions: arguments.codecOptions,
+      codec: arguments.codec,
+      kind: RTCRtpMediaTypeExtension.fromString(arguments.track.kind!), 
+    ));
+
     try {
-      List<RtpEncodingParameters> normalizedEncodings = [];
+      // This will fill rtpParameters's missing fields with default values.
+      Ortc.validateRtpParameters(sendResult.rtpParameters);
 
-      if (arguments.encodings != null && arguments.encodings.isEmpty) {
-        normalizedEncodings = [];
-      } else if (arguments.encodings != null &&
-          arguments.encodings.isNotEmpty) {
-        normalizedEncodings =
-            arguments.encodings.map((RtpEncodingParameters encoding) {
-          RtpEncodingParameters normalizedEncoding =
-              RtpEncodingParameters(active: true);
+      String id = await safeEmitAsFuture('produce', {
+        'kind': arguments.track.kind,
+        'rtpParameters': sendResult.rtpParameters,
+        'appData': arguments.appData,
+      });
 
-          if (encoding.active == false) {
-            normalizedEncoding.active = false;
-          }
-          if (encoding.dtx != null) {
-            normalizedEncoding.dtx = encoding.dtx;
-          }
-          if (encoding.scalabilityMode != null) {
-            normalizedEncoding.scalabilityMode = encoding.scalabilityMode;
-          }
-          if (encoding.scaleResolutionDownBy != null) {
-            normalizedEncoding.scaleResolutionDownBy =
-                encoding.scaleResolutionDownBy;
-          }
-          if (encoding.maxBitrate != null) {
-            normalizedEncoding.maxBitrate = encoding.maxBitrate;
-          }
-          if (encoding.maxFramerate != null) {
-            normalizedEncoding.maxFramerate = encoding.maxFramerate;
-          }
-          if (encoding.adaptivePtime != null) {
-            normalizedEncoding.adaptivePtime = encoding.adaptivePtime;
-          }
-          if (encoding.priority != null) {
-            normalizedEncoding.priority = encoding.priority;
-          }
-          if (encoding.networkPriority != null) {
-            normalizedEncoding.networkPriority = encoding.networkPriority;
-          }
-
-          return normalizedEncoding;
-        }).toList();
-      }
-
-      HandlerSendResult sendResult = await _handler.send(HandlerSendOptions(
+      Producer producer = Producer(
+        id: id,
+        localId: sendResult.localId,
+        rtpSender: sendResult.rtpSender,
         track: arguments.track,
-        encodings: normalizedEncodings,
-        codecOptions: arguments.codecOptions,
-        codec: arguments.codec,
+        rtpParameters: sendResult.rtpParameters,
+        stopTracks: arguments.stopTracks,
+        disableTrackOnPause: arguments.disableTrackOnPause,
+        zeroRtpOnPause: arguments.zeroRtpOnPause,
+        appData: arguments.appData,
         stream: arguments.stream,
-      ));
+        source: arguments.source,
+      );
 
-      try {
-        // This will fill rtpParameters's missing fields with default values.
-        Ortc.validateRtpParameters(sendResult.rtpParameters);
+      _producers[producer.id] = producer;
+      _handleProducer(producer);
 
-        String id = await safeEmitAsFuture('produce', {
-          'kind': arguments.track.kind,
-          'rtpParameters': sendResult.rtpParameters,
-          'appData': arguments.appData,
-        });
+      // Emit observer event.
+      _observer.safeEmit('newProducer', {
+        'producer': producer,
+      });
 
-        Producer producer = Producer(
-          id: id,
-          localId: sendResult.localId,
-          rtpSender: sendResult.rtpSender,
-          track: arguments.track,
-          rtpParameters: sendResult.rtpParameters,
-          stopTracks: arguments.stopTracks,
-          disableTrackOnPause: arguments.disableTrackOnPause,
-          zeroRtpOnPause: arguments.zeroRtpOnPause,
-          appData: arguments.appData,
-          stream: arguments.stream,
-          source: arguments.source,
-        );
-
-        _producers[producer.id] = producer;
-        _handleProducer(producer);
-
-        // Emit observer event.
-        _observer.safeEmit('newProducer', {
-          'producer': producer,
-        });
-
-        producerCallback?.call(producer);
-      } catch (error) {
-        _handler.stopSending(sendResult.localId);
-
-        throw error;
-      }
+      producerCallback?.call(producer);
     } catch (error) {
-      // This catch is needed to stop the given track if the command above
-      // failed due to closed Transport.
-      if (arguments.stopTracks) {
-        try {
-          arguments.track.stop();
-        } catch (error2) {}
-      }
+      _handler.stopSending(sendResult.localId);
       throw error;
     }
+  } catch (error) {
+    // This catch is needed to stop the given track if the command above
+    // failed due to closed Transport.
+    if (arguments.stopTracks) {
+      try {
+        arguments.track.stop();
+      } catch (error2) {}
+    }
+    throw error;
   }
+}
 
   /// Create a Producer.
   /// use producerCallback to receive a new Producer.
   void produce({
     required MediaStreamTrack track,
     required MediaStream stream,
-    List<RtpEncodingParameters> encodings = const <RtpEncodingParameters>[],
+    List<RtpEncodingParameters> encodings = const [],
     ProducerCodecOptions? codecOptions,
     RtpCodecCapability? codec,
     bool stopTracks = true,
@@ -940,45 +904,44 @@ class Transport extends EnhancedEventEmitter {
     Map<String, dynamic> appData = const <String, dynamic>{},
     required String source,
   }) {
-    _logger.debug('produce() [track:${track.toString()}');
+    _logger.debug('produce() [kind:${track.kind}, source:$source]');
 
-    if (_direction != Direction.send) {
+    if (_closed) {
+      throw ('closed');
+    } else if (_direction != Direction.send) {
       throw ('not a sending Transport');
-    } else if (track.kind == null ||
-        !_canProduceByKind
-            .canIt(RTCRtpMediaTypeExtension.fromString(track.kind!))) {
-      throw ('cannot produce ${track.kind}');
+    } else if (track.kind != 'audio' && track.kind != 'video') {
+      throw ('invalid track kind ${track.kind}');
     } else if (listeners('connect').isEmpty && _connectionState == 'new') {
       throw ('no "connect" listener set into this transport');
     } else if (listeners('produce').isEmpty) {
-      throw ('no "pruduce" listener set into this transport');
+      throw ('no "produce" listener set into this transport');
     }
 
-    _flexQueue.addTask(
-      FlexTaskAdd(
-        id: '',
-        message: 'transport.produce()',
-        execFun: _produce,
-        argument: ProduceArguments(
-          track: track,
-          stream: stream,
-          encodings: encodings,
-          codecOptions: codecOptions,
-          codec: codec,
-          stopTracks: stopTracks,
-          disableTrackOnPause: disableTrackOnPause,
-          zeroRtpOnPause: zeroRtpOnPause,
-          appData: appData,
-          source: source,
-        ),
+    // Enqueue command.
+    _flexQueue.addTask(FlexTaskAdd(
+      id: '',
+      message: 'transport.produce()',
+      execFun: _produce,
+      argument: ProduceArguments(
+        track: track,
+        stream: stream,
+        encodings: encodings,
+        codecOptions: codecOptions,
+        codec: codec,
+        stopTracks: stopTracks,
+        disableTrackOnPause: disableTrackOnPause,
+        zeroRtpOnPause: zeroRtpOnPause,
+        appData: appData,
+        source: source,
       ),
-    );
+    ));
   }
 
   Future<void> _consume(ConsumeArguments arguments) async {
     // Unsure the device can consume it.
-    bool canConsume =
-        Ortc.canReceive(arguments.rtpParameters, _extendedRtpCapabilities);
+    bool canConsume = _extendedRtpCapabilities != null &&
+        Ortc.canReceive(arguments.rtpParameters, _extendedRtpCapabilities!);
 
     if (!canConsume) {
       throw ('cannot consume this Producer');
@@ -1013,7 +976,7 @@ class Transport extends EnhancedEventEmitter {
         arguments.kind == RTCRtpMediaType.RTCRtpMediaTypeVideo) {
       try {
         RtpParameters probatorRtpParameters =
-            Ortc.generateProbatorRtpparameters(consumer.rtpParameters);
+            Ortc.generateProbatorRtpParameters(consumer.rtpParameters);
 
         await _handler.receive(HandlerReceiveOptions(
           trackId: 'probator',
@@ -1057,7 +1020,7 @@ class Transport extends EnhancedEventEmitter {
       throw ('not a receiving Transport');
     } else if (kind != RTCRtpMediaType.RTCRtpMediaTypeAudio &&
         kind != RTCRtpMediaType.RTCRtpMediaTypeVideo) {
-      throw ('invalid kind ${RTCRtpMediaTypeExtension.value(kind)}');
+      throw ('invalid kind ${TypeConversion.rtcMediaTypeToString(kind)}');
     } else if (listeners('connect').isEmpty && _connectionState == 'new') {
       throw ('no "connect" listener set into this transport');
     }

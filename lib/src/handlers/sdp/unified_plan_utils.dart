@@ -1,3 +1,5 @@
+import 'dart:math';
+import 'package:sdp_transform/sdp_transform.dart';
 import 'package:mediasoup_client_flutter/src/rtp_parameters.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/media_section.dart';
 import 'package:webrtc_interface/webrtc_interface.dart';
@@ -5,7 +7,6 @@ import 'dart:collection';
 import 'dart:math' as math;
 
 // Helper function to safely extract values that might be wrapped in IdentityMap
-// 🚨 CRITICAL FIX: Enhanced IdentityMap handling for all cases
 dynamic _safeExtractValue(dynamic value) {
   if (value == null) {
     return null;
@@ -13,11 +14,6 @@ dynamic _safeExtractValue(dynamic value) {
 
   if (value is Map) {
     // Handle IdentityMap<String, dynamic> case
-    print(
-        'DEBUG: _safeExtractValue: Processing IdentityMap with keys: ${value.keys.toList()}');
-    print(
-        'DEBUG: _safeExtractValue: Processing IdentityMap with values: ${value.values.toList()}');
-
     if (value.isEmpty) {
       return null;
     }
@@ -77,414 +73,268 @@ dynamic _safeExtractValue(dynamic value) {
 }
 
 class UnifiedPlanUtils {
-  static List<RtpEncodingParameters> getRtpEncodings(
-    MediaObject offerMediaObject,
-  ) {
-    try {
-      print(
-        'DEBUG: getRtpEncodings: Starting with ssrcs=${offerMediaObject.ssrcs?.length ?? 0}',
-      );
-
-      Set<int> usedSsrcs = {}; // Track used SSRCs to prevent duplicates
-      Map<int, int> fidGroups = {};
-      List<RtpEncodingParameters> encodings = [];
-
-      // First pass: collect all SSRCs and handle duplicates
-      if (offerMediaObject.ssrcs != null) {
-        for (Ssrc line in offerMediaObject.ssrcs!) {
-          if (line.id == null) {
-            print('DEBUG: getRtpEncodings: Skipping null SSRC line: $line');
-            continue;
-          }
-
-          // 🚨 CRITICAL FIX: Enhanced IdentityMap handling for line.id
-          dynamic idValue = line.id;
-          int? parsedSsrc;
-
-          if (idValue is Map) {
-            // Handle IdentityMap<String, dynamic> case
-            print(
-                'DEBUG: getRtpEncodings: Found IdentityMap line.id: $idValue');
-            print(
-                'DEBUG: getRtpEncodings: IdentityMap keys: ${idValue.keys.toList()}');
-            print(
-                'DEBUG: getRtpEncodings: IdentityMap values: ${idValue.values.toList()}');
-
-            if (idValue.isNotEmpty) {
-              // Try multiple approaches to extract SSRC
-              List<dynamic> candidateValues = [];
-
-              // Approach 1: Use values directly
-              candidateValues.addAll(idValue.values);
-
-              // Approach 2: Check if values are also Maps (nested IdentityMap)
-              for (dynamic value in idValue.values) {
-                if (value is Map && value.isNotEmpty) {
-                  candidateValues.addAll(value.values);
-                } else if (value is int) {
-                  candidateValues.add(value);
-                } else if (value is String) {
-                  int? parsed = int.tryParse(value);
-                  if (parsed != null) candidateValues.add(parsed);
-                }
-              }
-
-              // Approach 3: Check if keys contain numeric values
-              for (dynamic key in idValue.keys) {
-                if (key is String) {
-                  int? parsed = int.tryParse(key);
-                  if (parsed != null) candidateValues.add(parsed);
-                } else if (key is int) {
-                  candidateValues.add(key);
-                }
-              }
-
-              // Process candidate values and find valid SSRC
-              for (dynamic candidate in candidateValues) {
-                if (candidate is int && candidate > 0) {
-                  parsedSsrc = candidate;
-                  print(
-                      'DEBUG: getRtpEncodings: Extracted SSRC from IdentityMap: $parsedSsrc');
-                  break;
-                } else if (candidate is String) {
-                  int? parsed = int.tryParse(candidate);
-                  if (parsed != null && parsed > 0) {
-                    parsedSsrc = parsed;
-                    print(
-                        'DEBUG: getRtpEncodings: Parsed SSRC from IdentityMap string: $parsedSsrc');
-                    break;
-                  }
-                }
-              }
-            }
-          } else if (idValue is String) {
-            parsedSsrc = int.tryParse(idValue);
-          } else if (idValue is int) {
-            parsedSsrc = idValue;
-          }
-
-          if (parsedSsrc != null) {
-            if (!usedSsrcs.contains(parsedSsrc)) {
-              usedSsrcs.add(parsedSsrc);
-              print('DEBUG: getRtpEncodings: Added SSRC: $parsedSsrc');
-            } else {
-              print(
-                  'DEBUG: getRtpEncodings: Skipping duplicate SSRC: $parsedSsrc');
-            }
-          } else {
-            print(
-                'DEBUG: getRtpEncodings: Failed to parse SSRC from: $idValue');
-          }
-        }
+  // Track used SSRCs to ensure uniqueness
+  static final Set<int> _usedSsrcs = {};
+  static final math.Random _random = math.Random();
+  
+  /// Generates a unique SSRC that hasn't been used before in this session.
+  /// Uses a 31-bit random number (positive 32-bit integer).
+  static int _generateUniqueSsrc() {
+    int attempts = 0;
+    const maxAttempts = 10;
+    
+    while (attempts < maxAttempts) {
+      // Generate a 31-bit random number (positive 32-bit integer)
+      final ssrc = _random.nextInt(0x7FFFFFFF);
+      
+      if (!_usedSsrcs.contains(ssrc)) {
+        _usedSsrcs.add(ssrc);
+        print('DEBUG: Generated new unique SSRC: $ssrc');
+        return ssrc;
       }
+      
+      attempts++;
+      if (attempts == maxAttempts ~/ 2) {
+        print('WARNING: Having trouble finding a unique SSRC after $attempts attempts');
+      }
+    }
+    
+    // Fallback: use timestamp-based SSRC if we can't find a unique random one
+    final fallbackSsrc = (DateTime.now().millisecondsSinceEpoch & 0x7FFFFFFF);
+    print('WARNING: Using fallback timestamp-based SSRC: $fallbackSsrc');
+    _usedSsrcs.add(fallbackSsrc);
+    return fallbackSsrc;
+  }
 
-      // Convert set to list for further processing
-      List<int> ssrcs = usedSsrcs.toList();
+  /// Get RTP encodings from SDP media section (exact versatica signature pattern)
+  static List<RtpEncodingParameters> getRtpEncodings({
+    required Map<String, dynamic> offerMediaObject,
+  }) {
+    try {
+      print('DEBUG: getRtpEncodings: Starting with ssrcs=${offerMediaObject['ssrcs']?.length ?? 0}');
+
+      // Track all unique SSRCs
+      final ssrcs = <int>{};
+      
+      // First pass: collect all SSRCs
+      for (final line in offerMediaObject['ssrcs'] ?? []) {
+        final ssrcValue = _safeExtractValue(line['id']);
+        if (ssrcValue == null) continue;
+        
+        final ssrcNum = int.tryParse(ssrcValue.toString());
+        if (ssrcNum == null) continue;
+        
+        ssrcs.add(ssrcNum);
+      }
 
       if (ssrcs.isEmpty) {
-        print('DEBUG: getRtpEncodings: No valid SSRCs found, using fallback');
-        return _getFallbackEncodings();
+        throw Exception('No SSRCs found in offer');
       }
 
-      // Process SSRC groups for RTX mapping with enhanced IdentityMap handling
-      if (offerMediaObject.ssrcGroups != null) {
-        for (SsrcGroup group in offerMediaObject.ssrcGroups!) {
-          if (group.semantics == 'FID' && group.ssrcs != null) {
-            List<int> parsedSsrcs = [];
-            dynamic ssrcValue = group.ssrcs;
+      // Map to store SSRC to RTX SSRC mapping
+      final ssrcToRtxSsrc = <int, int?>{};
 
-            print(
-              'DEBUG: getRtpEncodings: Processing SSRC group with ssrcValue type: ${ssrcValue.runtimeType}, value: $ssrcValue',
-            );
+      // First handle FID (RTX) SSRC groups
+      for (final group in offerMediaObject['ssrcGroups'] ?? []) {
+        if ((group['semantics']?.toString().toLowerCase() ?? '') != 'fid') {
+          continue;
+        }
 
-            // 🚨 CRITICAL FIX: Enhanced IdentityMap handling for SSRC groups
-            if (ssrcValue is Map) {
-              print(
-                  'DEBUG: getRtpEncodings: Processing IdentityMap SSRC group with keys: ${ssrcValue.keys.toList()}');
-              print(
-                  'DEBUG: getRtpEncodings: Processing IdentityMap SSRC group with values: ${ssrcValue.values.toList()}');
+        try {
+          final ssrcsStr = _safeExtractValue(group['ssrcs'])?.toString()?.trim() ?? '';
+          if (ssrcsStr.isEmpty) continue;
+          
+          final ssrcList = ssrcsStr.split(' ').where((s) => s.isNotEmpty).toList();
+          if (ssrcList.length < 2) continue;
+          
+          final ssrc = int.tryParse(ssrcList[0]!);
+          final rtxSsrc = int.tryParse(ssrcList[1]!);
+          
+          if (ssrc == null || rtxSsrc == null) continue;
+          
+          // Only add if the primary SSRC exists in our set
+          if (ssrcs.contains(ssrc)) {
+            // Remove both SSRCs from the set to mark them as handled
+            ssrcs.remove(ssrc);
+            ssrcs.remove(rtxSsrc);
+            
+            // Add to the map
+            ssrcToRtxSsrc[ssrc] = rtxSsrc;
+            print('DEBUG: getRtpEncodings: Mapped SSRC $ssrc -> RTX $rtxSsrc');
+          }
+        } catch (e) {
+          print('WARNING: getRtpEncodings: Error processing FID group: $e');
+          continue;
+        }
+      }
 
-              // Try multiple approaches to extract SSRC values from IdentityMap
-              List<dynamic> candidateValues = [];
+      // Add remaining SSRCs (without RTX)
+      for (final ssrc in ssrcs) {
+        ssrcToRtxSsrc[ssrc] = null;
+      }
 
-              // Approach 1: Use values directly
-              candidateValues.addAll(ssrcValue.values);
-
-              // Approach 2: Check if values are also Maps (nested IdentityMap)
-              for (dynamic value in ssrcValue.values) {
-                if (value is Map && value.isNotEmpty) {
-                  candidateValues.addAll(value.values);
-                } else if (value is int) {
-                  candidateValues.add(value);
-                } else if (value is String) {
-                  int? parsed = int.tryParse(value);
-                  if (parsed != null) candidateValues.add(parsed);
-                }
-              }
-
-              // Approach 3: Check if keys contain numeric values
-              for (dynamic key in ssrcValue.keys) {
-                if (key is String) {
-                  int? parsed = int.tryParse(key);
-                  if (parsed != null) candidateValues.add(parsed);
-                } else if (key is int) {
-                  candidateValues.add(key);
-                }
-              }
-
-              // Process candidate values and find valid SSRCs
-              for (dynamic candidate in candidateValues) {
-                if (candidate is int && candidate > 0) {
-                  parsedSsrcs.add(candidate);
-                  print(
-                      'DEBUG: getRtpEncodings: Added SSRC from IdentityMap group: $candidate');
-                } else if (candidate is String) {
-                  int? parsed = int.tryParse(candidate);
-                  if (parsed != null && parsed > 0) {
-                    parsedSsrcs.add(parsed);
-                    print(
-                        'DEBUG: getRtpEncodings: Parsed SSRC from IdentityMap group string: $parsed');
-                  }
-                }
-              }
-            } else if (ssrcValue is String) {
-              // 🚨 CRITICAL FIX: Use _safeExtractValue for IdentityMap handling
-              String ssrcStr = _safeExtractValue(ssrcValue)?.toString() ?? '';
-              parsedSsrcs = ssrcStr
-                  .split(' ')
-                  .map((s) => int.tryParse(s))
-                  .where((s) => s != null)
-                  .cast<int>()
-                  .toList();
-            } else if (ssrcValue is List) {
-              // 🚨 CRITICAL FIX: Use _safeExtractValue for IdentityMap handling
-              parsedSsrcs = ssrcValue
-                  .map((s) {
-                    dynamic value = _safeExtractValue(s);
-                    return value != null
-                        ? int.tryParse(value.toString())
-                        : null;
-                  })
-                  .where((s) => s != null)
-                  .cast<int>()
-                  .toList();
-            }
-
-            if (parsedSsrcs.length >= 2) {
-              int primarySsrc = parsedSsrcs[0];
-              int rtxSsrc = parsedSsrcs[1];
-              fidGroups[primarySsrc] = rtxSsrc;
-              print(
-                'DEBUG: getRtpEncodings: Mapped SSRC $primarySsrc to RTX $rtxSsrc',
-              );
+      // Create RTP encodings
+      final encodings = <RtpEncodingParameters>[];
+      
+      for (final entry in ssrcToRtxSsrc.entries) {
+        final ssrc = entry.key;
+        final rtxSsrc = entry.value;
+        
+        try {
+          final encoding = RtpEncodingParameters(
+            ssrc: ssrc,
+            active: true,
+          );
+          
+          if (rtxSsrc != null) {
+            if (rtxSsrc <= 0) {
+              print('WARNING: getRtpEncodings: Invalid RTX SSRC: $rtxSsrc');
             } else {
-              print(
-                'DEBUG: getRtpEncodings: Skipping invalid SSRC group: $parsedSsrcs',
-              );
+              encoding.rtx = Rtx(ssrc: rtxSsrc);
             }
           }
+          
+          encodings.add(encoding);
+          print('DEBUG: getRtpEncodings: Created encoding: ssrc=$ssrc, rtxSsrc=$rtxSsrc');
+        } catch (e) {
+          print('ERROR: getRtpEncodings: Error creating encoding for SSRC $ssrc: $e');
+          rethrow;
         }
       }
 
-      // Create final encodings with RTX mappings
-      for (int ssrc in ssrcs) {
-        int? rtxSsrc = fidGroups[ssrc];
-        encodings.add(
-          RtpEncodingParameters(
-            ssrc: ssrc,
-            rtx: rtxSsrc != null ? RtxSsrc(rtxSsrc) : null,
-            active: true,
-          ),
-        );
-        print(
-          'DEBUG: getRtpEncodings: Added encoding: ssrc=$ssrc, rtxSsrc=$rtxSsrc',
-        );
-      }
-
-      // Ensure we have at least one encoding
       if (encodings.isEmpty) {
-        print('DEBUG: getRtpEncodings: No encodings found, creating default');
-        encodings.add(RtpEncodingParameters());
+        throw Exception('Failed to create any RTP encodings');
       }
 
-      print(
-        'DEBUG: getRtpEncodings: Final encodings=${encodings.map((e) => 'ssrc=${e.ssrc}, rtx=${e.rtx?.ssrc}').join(', ')}',
-      );
+      print('DEBUG: getRtpEncodings: Successfully created ${encodings.length} encodings');
       return encodings;
-    } catch (e) {
-      print('DEBUG: getRtpEncodings: Error: $e');
-      return _getFallbackEncodings();
+    } catch (error) {
+      print('ERROR: getRtpEncodings failed: $error');
+      rethrow;
     }
   }
 
-  static RtpParameters ensureSsrcInParams(RtpParameters rtpParameters) {
-    print(
-      'DEBUG: ensureSsrcInParams: Input encodings=${rtpParameters.encodings.map((e) => 'ssrc=${e.ssrc}').join(', ')}',
-    );
-    try {
-      print(
-        'DEBUG: ensureSsrcInParams: Starting with encodings=${rtpParameters.encodings.length}',
-      );
-      // Create a new list of encodings with SSRCs assigned
-      List<RtpEncodingParameters> updatedEncodings = [];
-      for (int i = 0; i < rtpParameters.encodings.length; i++) {
-        RtpEncodingParameters encoding = rtpParameters.encodings[i];
-        int? ssrc = encoding.ssrc;
-        if (ssrc == null) {
-          ssrc = _generateUniqueSsrc();
-          print(
-            'DEBUG: ensureSsrcInParams: Assigned SSRC=$ssrc to encoding $i',
-          );
-        }
-        RtxSsrc? rtx = encoding.rtx;
-        if (rtx?.ssrc == null && encoding.rtx != null) {
-          int newRtxSsrc = _generateUniqueSsrc();
-          rtx = RtxSsrc(newRtxSsrc);
-          print(
-            'DEBUG: ensureSsrcInParams: Assigned RTX SSRC=$newRtxSsrc to encoding $i',
-          );
-        }
-        updatedEncodings.add(
-          RtpEncodingParameters(
-            ssrc: ssrc,
-            rid: encoding.rid,
-            maxBitrate: encoding.maxBitrate,
-            maxFramerate: encoding.maxFramerate,
-            minBitrate: encoding.minBitrate,
-            dtx: encoding.dtx,
-            scalabilityMode: encoding.scalabilityMode,
-            scaleResolutionDownBy: encoding.scaleResolutionDownBy,
-            active: encoding.active,
-            rtx: rtx,
-          ),
-        );
-      }
-
-      // Create a new RtpParameters instance with updated encodings
-      RtpParameters updatedParams = RtpParameters(
-        mid: rtpParameters.mid,
-        codecs: List.from(rtpParameters.codecs),
-        headerExtensions: List.from(rtpParameters.headerExtensions),
-        encodings: updatedEncodings,
-        rtcp: rtpParameters.rtcp != null
-            ? RtcpParameters(
-                cname: rtpParameters.rtcp!.cname ??
-                    'default-cname-${math.Random().nextInt(1000000)}',
-                reducedSize: rtpParameters.rtcp!.reducedSize,
-                mux: rtpParameters.rtcp!.mux,
-              )
-            : null,
-      );
-
-      print(
-        'DEBUG: ensureSsrcInParams: Updated encodings=${updatedEncodings.map((e) => 'ssrc=${e.ssrc}, rtx=${e.rtx?.ssrc ?? null}')}]',
-      );
-      return updatedParams;
-    } catch (e) {
-      print('DEBUG: ensureSsrcInParams: Error: $e, returning original');
-      return rtpParameters;
+  /// Add legacy simulcast (exact versatica signature pattern)
+  static void addLegacySimulcast({
+    required Map<String, dynamic> offerMediaObject,
+    required int numStreams,
+  }) {
+    if (numStreams <= 1) {
+      throw ArgumentError('numStreams must be greater than 1');
     }
-  }
 
-  static List<RtpEncodingParameters> _getFallbackEncodings() {
-    int ssrc = _generateUniqueSsrc();
-    print('DEBUG: _getFallbackEncodings: Generated fallback SSRC=$ssrc');
-    return [RtpEncodingParameters(ssrc: ssrc)];
-  }
-
-  static void addLegacySimulcast(
-    MediaObject offerMediaObject,
-    int numStreams,
-    String? streamId,
-    String? trackId,
-  ) {
-    print(
-      'DEBUG: addLegacySimulcast: Starting with streamId=$streamId, trackId=$trackId, numStreams=$numStreams',
+    // Get the SSRC
+    final ssrcMsidLine = (offerMediaObject['ssrcs'] ?? []).firstWhere(
+      (line) => line['attribute'] == 'msid',
+      orElse: () => {'id': 0, 'attribute': '', 'value': ''}
     );
-    int? firstSsrc;
 
-    offerMediaObject.ssrcs ??= [];
-    for (Ssrc line in offerMediaObject.ssrcs!) {
-      if (line.attribute != 'msid' || (line.value?.isEmpty ?? true)) {
-        print(
-          'DEBUG: addLegacySimulcast: Skipping invalid msid line: attribute=${line.attribute}, value=${line.value}',
-        );
-        continue;
-      }
+    if (ssrcMsidLine['id'] == 0 || ssrcMsidLine['value'] == null) {
+      throw Exception('a=ssrc line with msid information not found');
+    }
 
-      // 🚨 CRITICAL FIX: Use _safeExtractValue for IdentityMap handling
-      String valueStr = _safeExtractValue(line.value)?.toString() ?? '';
-      print('DEBUG: addLegacySimulcast: Forced value to string: $valueStr');
+    final valueStr = _safeExtractValue(ssrcMsidLine['value'])?.toString() ?? '';
+    final tokens = valueStr.split(' ');
+    final streamId = tokens.isNotEmpty ? tokens[0] : '';
+    final trackId = tokens.length > 1 ? tokens[1] : '';
+    
+    final firstSsrc = int.tryParse(_safeExtractValue(ssrcMsidLine['id'])?.toString() ?? '0') ?? 0;
+    if (firstSsrc == 0) {
+      throw Exception('Invalid SSRC value');
+    }
 
-      final List<String> tokens = valueStr.split(' ');
-      final String msidStreamId = tokens.isNotEmpty ? tokens[0] : '';
-      final String msidTrackId = tokens.length > 1 ? tokens[1] : '';
-
-      if (msidStreamId == streamId && msidTrackId == trackId) {
-        // 🚨 CRITICAL FIX: Use _safeExtractValue for IdentityMap handling
-        firstSsrc = int.tryParse(_safeExtractValue(line.id)?.toString() ?? '0');
-        print(
-          'DEBUG: addLegacySimulcast: Found msid match: SSRC=${line.id}, streamId=$streamId, trackId=$trackId',
-        );
+    // Get the SSRC for RTX
+    int? firstRtxSsrc;
+    for (final group in offerMediaObject['ssrcGroups'] ?? []) {
+      if ((group['semantics']?.toString().toLowerCase() ?? '') != 'fid') continue;
+      
+      final ssrcsStr = _safeExtractValue(group['ssrcs'])?.toString() ?? '';
+      if (ssrcsStr.isEmpty) continue;
+      
+      final ssrcs = ssrcsStr.split(' ').where((s) => s.isNotEmpty).toList();
+      if (ssrcs.length < 2) continue;
+      
+      final ssrc = int.tryParse(ssrcs[0]!);
+      if (ssrc == firstSsrc) {
+        firstRtxSsrc = int.tryParse(ssrcs[1]!);
         break;
       }
     }
 
-    if (firstSsrc == null) {
-      print(
-        'DEBUG: addLegacySimulcast: No matching SSRC found, using fallback',
-      );
-      firstSsrc = _generateUniqueSsrc();
-      offerMediaObject.ssrcs!.add(
-        Ssrc(
-          id: firstSsrc,
-          attribute: 'msid',
-          value: '${streamId ?? '-'} ${trackId ?? '-'}',
-        ),
-      );
-      offerMediaObject.ssrcs!.add(
-        Ssrc(
-          id: firstSsrc,
-          attribute: 'cname',
-          value: 'cname-${math.Random().nextInt(1000000)}',
-        ),
-      );
+    // Get CNAME
+    final ssrcCnameLine = (offerMediaObject['ssrcs'] ?? []).firstWhere(
+      (line) => line['attribute'] == 'cname',
+      orElse: () => {'id': 0, 'attribute': '', 'value': ''}
+    );
+
+    if (ssrcCnameLine['value'] == null) {
+      throw Exception('a=ssrc line with cname information not found');
     }
 
-    if (numStreams > 1) {
-      offerMediaObject.ssrcGroups ??= [];
-      List<int> additionalSsrcs = [];
-      for (int i = 1; i < numStreams; i++) {
-        int newSsrc = _generateUniqueSsrc();
-        additionalSsrcs.add(newSsrc);
-        offerMediaObject.ssrcs!.add(
-          Ssrc(
-            id: newSsrc,
-            attribute: 'msid',
-            value: '${streamId ?? '-'} ${trackId ?? '-'}',
-          ),
-        );
-        offerMediaObject.ssrcs!.add(
-          Ssrc(
-            id: newSsrc,
-            attribute: 'cname',
-            value: 'cname-${math.Random().nextInt(1000000)}',
-          ),
-        );
+    final cname = _safeExtractValue(ssrcCnameLine['value'])?.toString() ?? '';
+    
+    // Generate SSRCs for simulcast
+    final ssrcs = <int>[];
+    final rtxSsrcs = <int>[];
+    
+    for (var i = 0; i < numStreams; i++) {
+      ssrcs.add(firstSsrc + i);
+      
+      if (firstRtxSsrc != null) {
+        rtxSsrcs.add(firstRtxSsrc + i);
       }
-      print(
-        'DEBUG: addLegacySimulcast: Adding SIM group with ssrcs=[${[
-          firstSsrc,
-          ...additionalSsrcs
-        ].join(', ')}]',
-      );
-      offerMediaObject.ssrcGroups!.add(
-        SsrcGroup(semantics: 'SIM', ssrcs: [firstSsrc, ...additionalSsrcs]),
-      );
+    }
+
+    // Clear existing SSRC groups and SSRCs
+    offerMediaObject['ssrcGroups'] = [];
+    offerMediaObject['ssrcs'] = [];
+
+    // Add SIM group
+    offerMediaObject['ssrcGroups']!.add({
+      'semantics': 'SIM',
+      'ssrcs': ssrcs.join(' '),
+    });
+
+    // Add SSRCs with cname and msid
+    for (final ssrc in ssrcs) {
+      offerMediaObject['ssrcs']!.add({
+        'id': ssrc,
+        'attribute': 'cname',
+        'value': cname,
+      });
+      
+      offerMediaObject['ssrcs']!.add({
+        'id': ssrc,
+        'attribute': 'msid',
+        'value': '$streamId $trackId',
+      });
+    }
+
+    // Add RTX SSRCs if available
+    if (rtxSsrcs.isNotEmpty) {
+      for (var i = 0; i < rtxSsrcs.length; i++) {
+        final ssrc = ssrcs[i];
+        final rtxSsrc = rtxSsrcs[i];
+        
+        // Add RTX SSRC with cname and msid
+        offerMediaObject['ssrcs']!.add({
+          'id': rtxSsrc,
+          'attribute': 'cname',
+          'value': cname,
+        });
+        
+        offerMediaObject['ssrcs']!.add({
+          'id': rtxSsrc,
+          'attribute': 'msid',
+          'value': '$streamId $trackId',
+        });
+        
+        // Add FID group for RTX
+        offerMediaObject['ssrcGroups']!.add({
+          'semantics': 'FID',
+          'ssrcs': '$ssrc $rtxSsrc',
+        });
+      }
     }
   }
-}
-
-int _generateUniqueSsrc() {
-  return math.Random().nextInt(4294967295);
 }

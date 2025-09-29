@@ -4,55 +4,70 @@ import 'package:sdp_transform/sdp_transform.dart';
 import 'package:mediasoup_client_flutter/src/producer.dart';
 import 'package:mediasoup_client_flutter/src/rtp_parameters.dart';
 import 'package:mediasoup_client_flutter/src/sctp_parameters.dart';
-import 'package:mediasoup_client_flutter/src/sdp_object.dart';
 import 'package:mediasoup_client_flutter/src/transport.dart';
 import 'package:mediasoup_client_flutter/src/common/logger.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/media_section.dart';
+import 'package:sdp_transform/sdp_transform.dart';
 
-Logger logger = Logger('RemoteSdp');
 
+Logger _logger = Logger('RemoteSdp');
+
+/// Represents a media section index and optional reuse MID
 class MediaSectionIdx {
   final int idx;
   final String? reuseMid;
 
-  MediaSectionIdx({
+  const MediaSectionIdx({
     required this.idx,
     this.reuseMid,
   });
 
-  MediaSectionIdx.fromMap(Map data)
-      : idx = data['idx'],
-        reuseMid = data['reuseMid'];
+  factory MediaSectionIdx.fromMap(Map<String, dynamic> data) {
+    return MediaSectionIdx(
+      idx: data['idx'] as int,
+      reuseMid: data['reuseMid'] as String?,
+    );
+  }
 
   Map<String, dynamic> toMap() {
     return {
       'idx': idx,
-      'reuseMid': reuseMid,
+      if (reuseMid != null) 'reuseMid': reuseMid,
     };
   }
+
+  @override
+  String toString() => 'MediaSectionIdx(${toMap()})';
 }
 
+/// RemoteSdp handles the SDP received from the remote peer.
 class RemoteSdp {
-  // Remote ICE parameters.
-  late IceParameters _iceParameters;
-  // Remote ICE candidates.
-  late List<IceCandidate> _iceCandidates;
-  // Remote DTLS parameters.
-  late DtlsParameters _dtlsParameters;
-  // Remote SCTP parameters.
-  late SctpParameters? _sctpParameters;
-  // Parameters for plain RTP (no SRTP nor DTLS no BUNDLE).
-  late PlainRtpParameters? _plainRtpParameters;
-  // Whether this is Plan-B SDP.
-  late bool _planB;
-  // MediaSection instances with same order as in the SDP.
-  List<MediaSection> _mediaSections = <MediaSection>[];
-  // MediaSection indices indexed by MID.
-  Map<String, int> _midToIndex = <String, int>{};
-  // First MID.
+  final IceParameters _iceParameters;
+  final List<IceCandidate> _iceCandidates;
+  final DtlsParameters _dtlsParameters;
+  final SctpParameters? _sctpParameters;
+  final PlainRtpParameters? _plainRtpParameters;
+  final bool _planB;
+  
+  final List<Map<String, dynamic>> _mediaSections = [];
+  final Map<String, int> _midToIndex = {};
   String? _firstMid;
-  // SDP object.
-  late SdpObject _sdpObject;
+  
+  Map<String, dynamic> _sdpObject = {
+    'version': 0,
+    'origin': {
+      'username': '-',
+      'sessionId': DateTime.now().millisecondsSinceEpoch,
+      'sessionVersion': 2,
+      'netType': 'IN',
+      'ipVer': 4,
+      'address': '0.0.0.0'
+    },
+    'name': '-',
+    'timing': {'start': 0, 'stop': 0},
+    'media': [],
+    'attributes': [],
+  };
 
   RemoteSdp({
     required IceParameters iceParameters,
@@ -61,344 +76,355 @@ class RemoteSdp {
     SctpParameters? sctpParameters,
     PlainRtpParameters? plainRtpParameters,
     bool planB = false,
-  }) {
-    _iceParameters = iceParameters;
-   _iceCandidates = List<IceCandidate>.from(iceCandidates.where((c) => c is IceCandidate));
-    _dtlsParameters = dtlsParameters;
-    _sctpParameters = sctpParameters;
-    _plainRtpParameters = plainRtpParameters;
-    _planB = planB;
-    _sdpObject = SdpObject(
-      version: 0,
-      origin: Origin(
-        address: '0.0.0.0',
-        ipVer: 4,
-        netType: 'IN',
-        sessionId: 10000,
-        sessionVersion: 0,
-        username: 'mediasoup-client',
-      ),
-      name: '-',
-      timing: Timing(
-        start: 0,
-        stop: 0,
-      ),
-      media: <MediaObject>[],
-    );
+  })  : _iceParameters = iceParameters,
+        _iceCandidates = List.unmodifiable(iceCandidates),
+        _dtlsParameters = dtlsParameters,
+        _sctpParameters = sctpParameters,
+        _plainRtpParameters = plainRtpParameters,
+        _planB = planB {
+    _logger.debug('constructor() [planB:$_planB]');
+    
+    _setupSessionLevelIceParameters();
+    _setupSessionLevelDtlsParameters();
+  }
 
-    // If ICE parameters are given, add ICE-Lite indicator.
-    if (iceParameters.iceLite) {
-      _sdpObject.icelite = 'ice-lite';
+  void _setupSessionLevelIceParameters() {
+    if (_iceParameters.iceLite) {
+      _addAttribute('ice-lite');
     }
-
-    // if DTLS parameters are given, assume WebRTC and BUNDLE.
-    // if (dtlsParameters != null) {
-      _sdpObject.msidSemantic = MsidSemantic(
-        semantic: 'WMS',
-        token: '*',
-      );
-
-      // NOTE: We take the latest fingerprint.
-      int numFingerprints = _dtlsParameters.fingerprints.length;
-
-      _sdpObject.fingerprint = Fingerprint(
-        type: dtlsParameters.fingerprints[numFingerprints - 1].algorithm,
-        hash: dtlsParameters.fingerprints[numFingerprints - 1].value,
-      );
-
-      _sdpObject.groups = [
-        Group(
-          type: 'BUNDLE',
-          mids: '',
-        ),
-      ];
-    // }
-
-    // If there are plain RPT parameters, override SDP origin.
-    if (plainRtpParameters != null) {
-      _sdpObject.origin.address = plainRtpParameters.ip;
-      _sdpObject.origin.ipVer = plainRtpParameters.ipVersion;
+    
+    _addAttribute('ice-options', 'trickle');
+    _addAttribute('ice-ufrag', _iceParameters.usernameFragment);
+    _addAttribute('ice-pwd', _iceParameters.password);
+    
+    for (final candidate in _iceCandidates) {
+      _addAttribute('candidate', _iceCandidateToSdp(candidate));
+    }
+  }
+  
+  void _setupSessionLevelDtlsParameters() {
+    if (_dtlsParameters.fingerprints != null && _dtlsParameters.fingerprints!.isNotEmpty) {
+      final fingerprint = _dtlsParameters.fingerprints!.first;
+      _addAttribute('fingerprint', '${fingerprint.algorithm} ${fingerprint.value}');
+    }
+    
+    String setup;
+    switch (_dtlsParameters.role) {
+      case DtlsRole.client:
+        setup = 'active';
+        break;
+      case DtlsRole.server:
+        setup = 'passive';
+        break;
+      default:
+        setup = 'actpass';
+    }
+    _addAttribute('setup', setup);
+  }
+  
+  void _addAttribute(String key, [dynamic value]) {
+    if (value == null) {
+      _sdpObject['attributes']!.add({'key': key});
+    } else {
+      _sdpObject['attributes']!.add({'key': key, 'value': value.toString()});
     }
   }
 
-  String getSdp() {
-    // Increase SDP version.
-    _sdpObject.origin.sessionVersion++;
-
-    return write(_sdpObject.toMap(), null);
+  String _iceCandidateToSdp(IceCandidate candidate) {
+    final components = [
+      candidate.foundation?.toString() ?? '',
+      candidate.component.toString(),
+      candidate.protocol?.value.toUpperCase() ?? 'UDP',
+      candidate.priority.toString(),
+      candidate.ip,
+      candidate.port.toString(),
+      'typ',
+      candidate.type.value,
+    ];
+  
+    // Use raddr and rport instead of relatedAddress/relatedPort
+    if (candidate.raddr != null && candidate.rport != null) {
+      components.addAll([
+        'raddr',
+        candidate.raddr!,
+        'rport',
+        candidate.rport.toString(),
+      ]);
+    }
+  
+    return components.join(' ');
   }
 
-  void updateIceParameters(IceParameters iceParameters) {
-    logger.debug(
-      'updateIceParameters() [iceParameters:$iceParameters]',
-    );
-
-    _iceParameters = iceParameters;
-    _sdpObject.icelite = iceParameters.iceLite ? 'ice-lite' : null;
-
-    for (MediaSection mediaSection in _mediaSections) {
-      mediaSection.setIceParameters(iceParameters);
-    }
-  }
-
-  void updateDtlsRole(DtlsRole role) {
-    logger.debug('updateDtlsRole() [role:$role]');
-
-    _dtlsParameters.role = role;
-
-    for (MediaSection mediaSection in _mediaSections) {
-      mediaSection.setDtlsRole(role);
-    }
-  }
-
-  void disableMediaSection(String mid) {
-    int? idx = _midToIndex[mid];
-
-    if (idx == null) {
-      throw ('no media section found with mid "$mid"');
-    }
-
-    MediaSection mediaSection = _mediaSections[idx];
-
-    mediaSection.disable();
-  }
-
-  void closeMediaSection(String mid) {
-    int? idx = _midToIndex[mid];
-
-    if (idx == null) {
-      throw ('no media section found with mid "$mid"');
-    }
-
-    MediaSection mediaSection = _mediaSections[idx];
-
-    // NOTE: Closing the first m section is a pain since it invalidates the
-    // bundled transport, so let's avoid it.
-    if (mid == _firstMid) {
-      logger.debug(
-        'closeMediaSection() | cannot close first media section, disabling it instead [mid: $mid]',
-      );
-
-      disableMediaSection(mid);
-
-      return;
-    }
-
-    mediaSection.close();
-
-    // Regenerate BUNDLE mids.
-    _regenerateBundleMids();
-  }
-
-  void planBStopReceiving(
-    String mid,
-    RtpParameters offerRtpParameters,
-  ) {
-    int? idx = _midToIndex[mid];
-
-    if (idx == null) {
-      throw ('no media section found with mid "$mid"');
-    }
-
-    OfferMediaSection mediaSection = _mediaSections[idx] as OfferMediaSection;
-
-    mediaSection.planBStopReceiving(offerRtpParameters: offerRtpParameters);
-    _replaceMediaSection(mediaSection, null);
-  }
-
+  /// Send method (versatica equivalent)
   void send({
-    required MediaObject offerMediaObject,
+    required Map<String, dynamic> offerMediaObject,
     String? reuseMid,
     required RtpParameters offerRtpParameters,
     required RtpParameters answerRtpParameters,
-    ProducerCodecOptions? codecOptions,
+    Map<String, dynamic>? codecOptions,
     bool extmapAllowMixed = false,
   }) {
-    AnswerMediaSection mediaSection = AnswerMediaSection(
-      iceParameters: _iceParameters,
-      iceCandidates: _iceCandidates,
-      dtlsParameters: _dtlsParameters,
-      plainRtpParameters: _plainRtpParameters,
-      planB: _planB,
-      offerMediaObject: offerMediaObject,
-      offerRtpParameters: offerRtpParameters,
-      answerRtpParameters: answerRtpParameters,
-      codecOptions: codecOptions,
-      extmapAllowMixed: extmapAllowMixed,
-    );
+    _logger.debug('send() [reuseMid:$reuseMid]');
 
-    // Unified-Plan with closed media section replacement.
-    if (reuseMid != null) {
-      _replaceMediaSection(mediaSection, reuseMid);
-    } else if (!_midToIndex.containsKey(mediaSection.mid)) {
-      // Unified-Plann or Plan-B with different media kind.
-      _addMediaSection(mediaSection);
+    final mid = offerMediaObject['mid']?.toString();
+    if (mid == null) {
+      throw Exception('Offer media object must have an MID');
+    }
+
+    int mediaSectionIdx;
+    if (reuseMid != null && _midToIndex.containsKey(reuseMid)) {
+      // Reuse existing media section
+      mediaSectionIdx = _midToIndex[reuseMid]!;
+      _replaceMediaSection(mediaSectionIdx, offerMediaObject);
+      _midToIndex.remove(reuseMid);
     } else {
-      // Plan-B with same media kind.
-      _replaceMediaSection(mediaSection, null);
-    }
-  }
-
-  void receive({
-    required String mid,
-    required RTCRtpMediaType kind,
-    required RtpParameters offerRtpParameters,
-    required String streamId,
-    required String trackId,
-  }) {
-    int? idx = _midToIndex[mid];
-    OfferMediaSection? mediaSection;
-
-    if (idx != null) {
-      mediaSection = _mediaSections[idx] as OfferMediaSection;
+      // Add new media section
+      mediaSectionIdx = _addMediaSection(offerMediaObject);
     }
 
-    // Unified-Plan or different media kind.
-    if (mediaSection == null) {
-      mediaSection = OfferMediaSection(
-        iceParameters: _iceParameters,
-        iceCandidates: _iceCandidates,
-        dtlsParameters: _dtlsParameters,
-        plainRtpParameters: _plainRtpParameters,
-        planB: _planB,
-        mid: mid,
-        kind: RTCRtpMediaTypeExtension.value(kind),
-        offerRtpParameters: offerRtpParameters,
-        streamId: streamId,
-        trackId: trackId,
-      );
+    _midToIndex[mid] = mediaSectionIdx;
+    _firstMid ??= mid;
 
-      // Let's try to recycle a closed media section (if any).
-      // NOTE: Yes, we can recycle a closed m=audio section with a new m=video.
-      MediaSection? oldMediaSection = _mediaSections.firstWhereOrNull(
-        (MediaSection m) => m.closed,
-      );
-
-      if (oldMediaSection != null) {
-        _replaceMediaSection(mediaSection, oldMediaSection.mid);
-      } else {
-        _addMediaSection(mediaSection);
-      }
-    } else {
-      // Plan-B.
-      mediaSection.planBReceive(
-        offerRtpParameters: offerRtpParameters,
-        streamId: streamId,
-        trackId: trackId,
-      );
-
-      _replaceMediaSection(mediaSection, null);
-    }
-  }
-
-  void sendSctpAssociation(MediaObject offerMediaObject) {
-    AnswerMediaSection mediaSection = AnswerMediaSection(
-      iceParameters: _iceParameters,
-      iceCandidates: _iceCandidates,
-      dtlsParameters: _dtlsParameters,
-      plainRtpParameters: _plainRtpParameters,
-      offerMediaObject: offerMediaObject,
-    );
-
-    _addMediaSection(mediaSection);
-  }
-
-  void receiveSctpAssociation({bool oldDataChannelSpec = false}) {
-    OfferMediaSection mediaSection = OfferMediaSection(
-      iceParameters: _iceParameters,
-      iceCandidates: _iceCandidates,
-      dtlsParameters: _dtlsParameters,
-      sctpParameters: _sctpParameters,
-      plainRtpParameters: _plainRtpParameters,
-      mid: 'datachannel',
-      kind: 'application',
-      oldDataChannelSpec: oldDataChannelSpec,
-    );
-
-    _addMediaSection(mediaSection);
-  }
-
-  MediaSectionIdx getNextMediaSectionIdx() {
-    // If a closed media section is found, return its index.
-    for (int idx = 0; idx < _mediaSections.length; ++idx) {
-      MediaSection mediaSection = _mediaSections[idx];
-
-      if (mediaSection.closed) {
-        return MediaSectionIdx(
-          idx: idx,
-          reuseMid: mediaSection.mid!,
-        );
-      }
-    }
-
-    // If no closed media section is found, return next one.
-    return MediaSectionIdx(idx: _mediaSections.length);
-  }
-
-  void _regenerateBundleMids() {
-    // if (_dtlsParameters == null) {
-    //   return;
-    // }
-
-    _sdpObject.groups[0].mids = _mediaSections
-        .where((MediaSection mediaSection) => !mediaSection.closed)
-        .map((MediaSection mediaSection) => mediaSection.mid)
-        .join(' ');
-  }
-
-  void _addMediaSection(MediaSection newMediaSection) {
-    if (_firstMid == null) {
-      _firstMid = newMediaSection.mid!;
-    }
-
-    // Add to the vector.
-    _mediaSections.add(newMediaSection);
-
-    // Add to the map.
-    _midToIndex[newMediaSection.mid!] = _mediaSections.length - 1;
-
-    // Add to the SDP object.
-    _sdpObject.media.add(newMediaSection.getObject);
-
-    // Regenrate Bundle mids.
     _regenerateBundleMids();
   }
 
-  void _replaceMediaSection(MediaSection newMediaSection, dynamic reuseMid) {
-    // Store it in the map.
-    if (reuseMid is String) {
-      int? idx = _midToIndex[reuseMid];
+  /// Receive method (versatica equivalent)
+  void receive({
+    required String mid,
+    required String kind,
+    required RtpParameters offerRtpParameters,
+    String? streamId,
+    String? trackId,
+  }) {
+    _logger.debug('receive() [mid:$mid, kind:$kind]');
 
-      if (idx == null) {
-        throw ('no media section found for reuseMid "$reuseMid"');
+    final mediaSection = {
+      'mid': mid,
+      'type': kind,
+      'port': 9,
+      'protocol': 'UDP/TLS/RTP/SAVPF',
+      'direction': 'recvonly',
+      'rtp': [],
+      'fmtp': [],
+      'rtcpFb': [],
+      'ext': [],
+      'ssrcs': [],
+      'ssrcGroups': [],
+      'attributes': [],
+    };
+
+    // Add codecs from offer parameters
+    for (final codec in offerRtpParameters.codecs) {
+      (mediaSection['rtp'] as List).add({
+        'payload': codec.payloadType,
+        'codec': codec.mimeType.split('/')[1].toUpperCase(),
+        'rate': codec.clockRate,
+        if (codec.channels != null && codec.channels! > 1) 'encoding': codec.channels,
+      });
+    }
+
+    final mediaSectionIdx = _addMediaSection(mediaSection);
+    _midToIndex[mid] = mediaSectionIdx;
+    _firstMid ??= mid;
+
+    _regenerateBundleMids();
+  }
+
+  /// Receive SCTP association (versatica equivalent)
+  void receiveSctpAssociation({Map<String, dynamic>? sctpParameters}) {
+    _logger.debug('receiveSctpAssociation()');
+
+    const mid = 'datachannel';
+    const kind = 'application';
+
+    final mediaSection = {
+      'mid': mid,
+      'type': kind,
+      'port': 5000,
+      'protocol': 'UDP/DTLS/SCTP',
+      'direction': 'sendrecv',
+      'sctp': {
+        'port': sctpParameters?['port'] ?? 5000,
+        'protocol': sctpParameters?['protocol'] ?? 'webrtc-datachannel',
+      },
+      'attributes': [],
+    };
+
+    final mediaSectionIdx = _addMediaSection(mediaSection);
+    _midToIndex[mid] = mediaSectionIdx;
+    _firstMid ??= mid;
+
+    _regenerateBundleMids();
+  }
+
+  void sendSctpAssociation(Map<String, dynamic> offerMediaObject) {
+    _logger.debug('sendSctpAssociation()');
+
+    const mid = 'datachannel';
+    const kind = 'application';
+
+    // Create media section based on offer
+    final mediaSection = {
+      'mid': mid,
+      'type': kind,
+      'port': offerMediaObject['port'] ?? 5000,
+      'protocol': offerMediaObject['protocol'] ?? 'UDP/DTLS/SCTP',
+      'direction': 'sendrecv',
+      'sctp': offerMediaObject['sctp'],
+      'attributes': [],
+    };
+
+    final mediaSectionIdx = _addMediaSection(mediaSection);
+    _midToIndex[mid] = mediaSectionIdx;
+    _firstMid ??= mid;
+
+    _regenerateBundleMids();
+  }
+
+  /// Disable media section (versatica equivalent)
+  void disableMediaSection(String mid) {
+    _logger.debug('disableMediaSection() [mid:$mid]');
+
+    final mediaSectionIdx = _midToIndex[mid];
+    if (mediaSectionIdx == null) {
+      _logger.warn('disableMediaSection() | media section not found for mid:$mid');
+      return;
+    }
+
+    final mediaSection = _mediaSections[mediaSectionIdx];
+    mediaSection['direction'] = 'inactive';
+
+    _regenerateBundleMids();
+  }
+
+  /// Close media section (versatica equivalent)
+  void closeMediaSection(String mid) {
+    _logger.debug('closeMediaSection() [mid:$mid]');
+
+    final mediaSectionIdx = _midToIndex[mid];
+    if (mediaSectionIdx == null) {
+      _logger.warn('closeMediaSection() | media section not found for mid:$mid');
+      return;
+    }
+
+    // Remove from media sections list
+    _mediaSections.removeAt(mediaSectionIdx);
+    _midToIndex.remove(mid);
+
+    // Update indices in midToIndex map
+    _midToIndex.forEach((existingMid, idx) {
+      if (idx > mediaSectionIdx) {
+        _midToIndex[existingMid] = idx - 1;
       }
+    });
 
-      MediaSection oldMediaSection = _mediaSections[idx];
+    // Remove from SDP media list
+    _sdpObject['media']!.removeAt(mediaSectionIdx);
 
-      // Replace the index in the vector with the new media section.
-      _mediaSections[idx] = newMediaSection;
+    _regenerateBundleMids();
+  }
 
-      // Update the map.
-      _midToIndex.remove(oldMediaSection.mid);
-      _midToIndex[newMediaSection.mid!] = idx;
+  /// Get next media section index (versatica equivalent)
+  MediaSectionIdx getNextMediaSectionIdx() {
+    if (_planB) {
+      // In planB, reuse first media section
+      return MediaSectionIdx(idx: 0);
+    }
 
-      // Update the SDP object.
-      _sdpObject.media[idx] = newMediaSection.getObject;
+    // In unified plan, add new media section
+    return MediaSectionIdx(idx: _mediaSections.length);
+  }
 
-      // Regenerate BUNDLE mids.
-      _regenerateBundleMids();
-    } else {
-      int? idx = _midToIndex[newMediaSection.mid];
+  /// Get SDP string (versatica equivalent)
+  String getSdp() {
+    return write(_sdpObject, null);
+  }
 
-      if (idx == null) {
-        throw ('no media section found with mid "${newMediaSection.mid}"');
-      }
+  /// Update ICE parameters (versatica equivalent)
+  void updateIceParameters(IceParameters iceParameters) {
+    _logger.debug('updateIceParameters()');
 
-      // Replace the index in the vector with the new media section.
-      _mediaSections[idx] = newMediaSection;
+    // Remove existing ICE attributes
+    _removeAttributes(['ice-ufrag', 'ice-pwd', 'ice-lite', 'ice-options', 'candidate']);
 
-      // Update the SDP object.
-      _sdpObject.media[idx] = newMediaSection.getObject;
+    // Add new ICE parameters
+    if (iceParameters.iceLite) {
+      _addAttribute('ice-lite');
+    }
+
+    _addAttribute('ice-options', 'trickle');
+    _addAttribute('ice-ufrag', iceParameters.usernameFragment);
+    _addAttribute('ice-pwd', iceParameters.password);
+
+    for (final candidate in _iceCandidates) {
+      _addAttribute('candidate', _iceCandidateToSdp(candidate));
     }
   }
+
+  /// Update DTLS role (versatica equivalent)
+  void updateDtlsRole(DtlsRole role) {
+    _logger.debug('updateDtlsRole() [role:$role]');
+
+    String setup;
+    switch (role) {
+      case DtlsRole.client:
+        setup = 'active';
+        break;
+      case DtlsRole.server:
+        setup = 'passive';
+        break;
+      default:
+        setup = 'actpass';
+    }
+
+    _removeAttributes(['setup']);
+    _addAttribute('setup', setup);
+  }
+
+  // ========== PRIVATE METHODS ==========
+
+  void _addAttributeToMedia(Map<String, dynamic> media, String key, [dynamic value]) {
+    media['attributes'] ??= [];
+    if (value == null) {
+      media['attributes']!.add({'key': key});
+    } else {
+      media['attributes']!.add({'key': key, 'value': value.toString()});
+    }
+  }
+
+  void _removeAttributes(List<String> keys) {
+    _sdpObject['attributes']!.removeWhere((attr) => keys.contains(attr['key']));
+  }
+
+  int _addMediaSection(Map<String, dynamic> mediaSection) {
+    final idx = _mediaSections.length;
+    _mediaSections.add(mediaSection);
+    _sdpObject['media']!.add(mediaSection);
+    return idx;
+  }
+
+  void _replaceMediaSection(int index, Map<String, dynamic> newMediaSection) {
+    if (index >= _mediaSections.length) {
+      throw Exception('Media section index out of bounds: $index');
+    }
+
+    _mediaSections[index] = newMediaSection;
+    _sdpObject['media']![index] = newMediaSection;
+  }
+
+  void _regenerateBundleMids() {
+    // Remove existing BUNDLE group
+    _removeAttributes(['group']);
+
+    if (_mediaSections.isEmpty) return;
+
+    // Create new BUNDLE group with all MIDs
+    final mids = _mediaSections.map((s) => s['mid']?.toString()).whereType<String>().toList();
+    if (mids.isNotEmpty) {
+      _addAttribute('group', 'BUNDLE ${mids.join(' ')}');
+    }
+  }
+
+  @override
+  String toString() => 'RemoteSdp(mediaSections: ${_mediaSections.length})';
 }
