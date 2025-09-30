@@ -1,4 +1,3 @@
-
 import 'dart:convert';
 
 import 'package:collection/collection.dart';
@@ -11,6 +10,7 @@ import 'package:h264_profile_level_id/h264_profile_level_id.dart';
 String RTP_PROBATOR_MID = 'probator';
 int RTP_PROBATOR_SSRC = 1234;
 int RTP_PROBATOR_CODEC_PAYLOAD_TYPE = 127;
+
 class Ortc {
   /// Validates RtcpFeedback. It may modify given data by adding missing
   /// fields with default values.
@@ -569,18 +569,31 @@ class Ortc {
   ) {
     List<RtpCodecParameters> filteredCodecs = [];
 
-    // if no capability codec is given, take the first one (and RTX).
-    if (capCodec == null) {
-      filteredCodecs.add(codecs.first);
+    // Determine MediaKind from mimeType
+    MediaKind getMediaKind(String mimeType) {
+      return mimeType.toLowerCase().startsWith('audio/') ? MediaKind.audio : MediaKind.video;
+    }
 
-      if (codecs.length > 1 && isRtxCodec(RtpCodecCapability(mimeType: codecs[1].mimeType, clockRate: codecs[1].clockRate, kind: MediaKind.video))) {
-        filteredCodecs.add(codecs[1]);
+    // If no capability codec is given, take the first one (and RTX if present).
+    if (capCodec == null) {
+      if (codecs.isNotEmpty) {
+        filteredCodecs.add(codecs.first);
+        if (codecs.length > 1 && isRtxCodec(RtpCodecCapability(
+              mimeType: codecs[1].mimeType,
+              clockRate: codecs[1].clockRate,
+              kind: getMediaKind(codecs[1].mimeType),
+              channels: codecs[1].channels,
+              parameters: codecs[1].parameters,
+              rtcpFeedback: codecs[1].rtcpFeedback,
+            ))) {
+          filteredCodecs.add(codecs[1]);
+        }
       }
     } else {
-      // Otherwise look for a compatible set of codecs.
+      // Look for a compatible set of codecs.
       for (int idx = 0; idx < codecs.length; ++idx) {
         final codecCapability = RtpCodecCapability(
-          kind: MediaKind.video, // This should be determined from mimeType
+          kind: getMediaKind(codecs[idx].mimeType),
           mimeType: codecs[idx].mimeType,
           clockRate: codecs[idx].clockRate,
           channels: codecs[idx].channels,
@@ -590,17 +603,22 @@ class Ortc {
 
         if (matchCodecs(aCodec: codecCapability, bCodec: capCodec)) {
           filteredCodecs.add(codecs[idx]);
-
-          if (idx + 1 < codecs.length && isRtxCodec(RtpCodecCapability(mimeType: codecs[idx + 1].mimeType, clockRate: codecs[idx + 1].clockRate, kind: MediaKind.video))) {
+          if (idx + 1 < codecs.length && isRtxCodec(RtpCodecCapability(
+                mimeType: codecs[idx + 1].mimeType,
+                clockRate: codecs[idx + 1].clockRate,
+                kind: getMediaKind(codecs[idx + 1].mimeType),
+                channels: codecs[idx + 1].channels,
+                parameters: codecs[idx + 1].parameters,
+                rtcpFeedback: codecs[idx + 1].rtcpFeedback,
+              ))) {
             filteredCodecs.add(codecs[idx + 1]);
           }
-
           break;
         }
       }
 
       if (filteredCodecs.isEmpty) {
-        throw ('no matching codec found');
+        throw Exception('No matching codec found');
       }
     }
 

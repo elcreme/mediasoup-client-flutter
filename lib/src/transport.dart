@@ -543,24 +543,26 @@ class Transport extends EnhancedEventEmitter {
   void _handleHandler() {
     HandlerInterface handler = _handler;
 
-    handler.on(
+    _handler.on(
       '@connect',
       (Map data) {
-        DtlsParameters dtlsParameters = data['dtlsParameters'];
-        Function callback = data['callback'];
-        Function errback = data['errback'];
-
         if (_closed) {
-          errback('closed');
-
+          data['errback']('closed');
           return;
         }
 
-        safeEmit('connect', {
-          'dtlsParameters': dtlsParameters,
-          'callback': callback,
-          'errback': errback
-        });
+        _flexQueue.addTask(FlexTaskAdd(
+          id: 'connect',
+          message: 'transport.connect()',
+          execFun: () async {
+            try {
+              final dtlsParameters = await _handler.getDtlsParameters();
+              data['callback'](dtlsParameters);
+            } catch (e) {
+              data['errback'](e);
+            }
+          },
+        ));
       },
     );
 

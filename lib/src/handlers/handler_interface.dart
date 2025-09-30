@@ -129,7 +129,8 @@ class HandlerSendOptions {
   final List<RtpEncodingParameters> encodings;
   final ProducerCodecOptions? codecOptions;
   final RtpCodecCapability? codec;
-  final RTCRtpMediaType kind;  
+  final RTCRtpMediaType kind;
+  final String? source;  
 
   HandlerSendOptions({
     required this.track,
@@ -137,7 +138,8 @@ class HandlerSendOptions {
     required this.encodings,
     this.codecOptions,
     this.codec,
-    required this.kind,  
+    required this.kind,
+    this.source,
   });
 }
 
@@ -237,6 +239,11 @@ abstract class HandlerInterface extends EnhancedEventEmitter {
   ///  )
   ///@emits @connectionstatechange - (connectionState: ConnectionState)
   String get name;
+
+  /// Get the local DTLS parameters of the handler.
+  /// 
+  /// @returns {Promise<DtlsParameters>} The local DTLS parameters.
+  Future<DtlsParameters> getDtlsParameters();
   Future<void> close();
   Future<RtpCapabilities> getNativeRtpCapabilities();
   // Future<SctpCapabilities> getNativeSctpCapabilities();

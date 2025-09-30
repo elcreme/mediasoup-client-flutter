@@ -41,6 +41,7 @@ class UnifiedPlan extends HandlerInterface {
   bool _hasDataChannelMediaSection = false;
   int _nextSendSctpStreamId = 0;
   bool _transportReady = false;
+  ExtendedRtpCapabilities? _extendedRtpCapabilities;
 
   UnifiedPlan() : super();
 
@@ -313,6 +314,7 @@ class UnifiedPlan extends HandlerInterface {
   void run({required HandlerRunOptions options}) async {
     _logger.debug('run()');
     _direction = options.direction;
+    _extendedRtpCapabilities = options.extendedRtpCapabilities;
 
     _remoteSdp = RemoteSdp(
       iceParameters: options.iceParameters,
@@ -375,85 +377,155 @@ class UnifiedPlan extends HandlerInterface {
     };
   }
 
+    Future<DtlsParameters> getDtlsParameters() async {
+      _logger.debug('getDtlsParameters()');
+      final offer = await _pc!.createOffer({}); // Use Map for options
+      final localSdpObject = parse(offer.sdp ?? '');
+      final dtlsParameters = CommonUtils.extractDtlsParameters(localSdpObject);
+      dtlsParameters.role = DtlsRole.auto;
+      return dtlsParameters;
+    }
+
   @override
   Future<HandlerSendResult> send(HandlerSendOptions options) async {
     _assertSendDirection();
-    _logger.debug('send() [kind:${options.track.kind}, track.id:${options.track.id}]');
+    _logger.debug('send() [kind:${options.track.kind}, track.id:${options.track.id}, source:${options.source ?? 'unknown'}]');
 
-    try {
-      // Create offer to get media section
-      RTCSessionDescription offer = await _pc!.createOffer({});
-      Map<String, dynamic> localSdpMap = parse(offer.sdp!);
-      
-      // Find the media section for this track kind
-      Map<String, dynamic>? offerMediaObject;
-      for (var media in localSdpMap['media'] ?? []) {
-        if (media['type'] == TypeConversion.rtcMediaTypeToString(options.kind)) {
-          offerMediaObject = media;
-          break;
+    final track = options.track;
+    final encodings = options.encodings;
+    final codecOptions = options.codecOptions;
+    final codec = options.codec;
+    final stream = options.stream;
+
+    if (encodings != null && encodings.length > 1) {
+      for (int idx = 0; idx < encodings.length; idx++) {
+        encodings[idx].rid = 'r$idx';
+      }
+    }
+
+    List<RTCRtpEncoding>? rtcEncodings;
+    if (encodings != null) {
+      rtcEncodings = encodings.map((e) => RTCRtpEncoding(
+            rid: e.rid,
+            active: e.active ?? true,
+            maxBitrate: e.maxBitrate,
+            maxFramerate: e.maxFramerate?.round(),
+            scaleResolutionDownBy: e.scaleResolutionDownBy,
+          )).toList();
+    }
+
+    final transceiver = await _pc!.addTransceiver(
+      track: track,
+      init: RTCRtpTransceiverInit(
+        direction: TransceiverDirection.SendOnly,
+        streams: [stream],
+        sendEncodings: rtcEncodings,
+      ),
+    );
+
+    final offer = await _pc!.createOffer({});
+    var localSdpObject = parse(offer.sdp ?? '');
+
+    Map<String, dynamic>? offerMediaObject = localSdpObject['media'].firstWhere(
+      (m) => m['mid'] == transceiver.mid && m['type'] == track.kind,
+      orElse: () => null,
+    );
+
+    if (offerMediaObject == null) {
+      throw Exception('No media section found for MID: ${transceiver.mid} and kind: ${track.kind}');
+    }
+
+    if (encodings != null) {
+      offerMediaObject['rtp'] = [];
+      offerMediaObject['fmtp'] = [];
+      for (var encoding in encodings) {
+        int pt = 96 + encodings.indexOf(encoding);
+        offerMediaObject['rtp'].add({
+          'payload': pt,
+          'codec': codec?.mimeType.split('/')[1] ?? 'VP8',
+          'rate': codec?.clockRate ?? 90000,
+        });
+        if (codecOptions != null) {
+          final params = codecOptions.toMap();
+          if (params.isNotEmpty) {
+            offerMediaObject['fmtp'].add({
+              'payload': pt,
+              'config': params.entries.map((e) => '${e.key}=${e.value}').join(';'),
+            });
+          }
         }
       }
-
-      if (offerMediaObject == null) {
-        throw Exception('No media section found for kind: ${options.kind}');
-      }
-
-      // Get RTP encodings from SDP
-      List<RtpEncodingParameters> encodings = UnifiedPlanUtils.getRtpEncodings(
-        offerMediaObject: offerMediaObject,
-      );
-
-      // Create sending RTP parameters
-      RtpParameters sendingRtpParameters = RtpParameters(
-        mid: offerMediaObject['mid'],
-        codecs: [],
-        headerExtensions: [],
-        encodings: encodings,
-        rtcp: RtcpParameters(
-          cname: CommonUtils.getCname(offerMediaObject),
-          reducedSize: true,
-          mux: true,
-        ),
-      );
-
-      // Update remote SDP
-      _remoteSdp.send(
-        offerMediaObject: offerMediaObject,
-        offerRtpParameters: sendingRtpParameters,
-        answerRtpParameters: _sendingRemoteRtpParametersByKind[options.kind]!,
-        codecOptions: options.codecOptions != null ? {'codecOptions': options.codecOptions} : null,
-        extmapAllowMixed: true,
-      );
-
-      RTCSessionDescription answer = RTCSessionDescription(_remoteSdp.getSdp(), 'answer');
-      _logger.debug('send() | calling pc.setRemoteDescription() [answer:${answer.toMap()}]');
-      
-      await _pc!.setRemoteDescription(answer);
-
-      // Add track to peer connection
-      RTCRtpSender sender = await _pc!.addTrack(options.track, options.stream);
-      
-      // Get the transceiver for this sender
-      final transceivers = await _pc!.getTransceivers();
-      RTCRtpTransceiver? transceiver = transceivers.firstWhereOrNull((t) => t.sender == sender);
-
-      if (transceiver == null) {
-        throw Exception('Transceiver not found for sender');
-      }
-
-      String localId = _safeExtractValue(transceiver.mid) ?? _mapMidTransceiver.length.toString();
-      _mapMidTransceiver[localId] = transceiver;
-
-      return HandlerSendResult(
-        localId: localId,
-        rtpParameters: sendingRtpParameters,
-        rtpSender: sender,
-      );
-
-    } catch (error) {
-      _logger.error('send() failed: $error');
-      rethrow;
+      offerMediaObject['payloads'] = offerMediaObject['rtp'].map((r) => r['payload']).join(' ');
     }
+
+    if (codec != null) {
+      offerMediaObject['rtp'] = [
+        ...offerMediaObject['rtp'].where((r) => r['codec'].toLowerCase() == codec.mimeType.split('/')[1].toLowerCase()),
+        ...offerMediaObject['rtp'].where((r) => r['codec'].toLowerCase() != codec.mimeType.split('/')[1].toLowerCase()),
+      ];
+      offerMediaObject['payloads'] = offerMediaObject['rtp'].map((r) => r['payload']).join(' ');
+    }
+
+    final modifiedSdp = write(localSdpObject, null);
+    await _pc!.setLocalDescription(RTCSessionDescription(modifiedSdp, 'offer'));
+
+    final sendingRtpParameters = Ortc.getSendingRtpParameters(
+      TypeConversion.rtcToMediaKind(transceiver.sender.track!.kind == 'audio'
+          ? RTCRtpMediaType.RTCRtpMediaTypeAudio
+          : RTCRtpMediaType.RTCRtpMediaTypeVideo),
+      _extendedRtpCapabilities!,
+    );
+
+    // Handle extracted codecs and assign payloadType
+    final extractedCodecs = CommonUtils.extractRtpCapabilities(offerMediaObject).codecs;
+    final codecParameters = extractedCodecs.asMap().entries.map((entry) {
+      final c = entry.value;
+      return RtpCodecParameters(
+        mimeType: c.mimeType,
+        clockRate: c.clockRate,
+        payloadType: 96 + entry.key, // Assign dynamic payload type
+        channels: c.channels,
+        parameters: c.parameters,
+        rtcpFeedback: c.rtcpFeedback,
+      );
+    }).toList();
+
+    sendingRtpParameters.codecs = Ortc.reduceCodecs(codecParameters, codec);
+    sendingRtpParameters.encodings = encodings ?? [RtpEncodingParameters(scaleResolutionDownBy: 1.0)];
+    
+    // Debug log the extensions before processing
+    _logger.debug('offerMediaObject[ext]: ${offerMediaObject['ext']}');
+    
+    try {
+      sendingRtpParameters.headerExtensions = (offerMediaObject['ext'] as List<dynamic>?)?.map((e) {
+        final uri = e['uri']?.toString();
+        final id = e['id'] is int ? e['id'] : int.tryParse(e['id']?.toString() ?? '0') ?? 0;
+        
+        if (uri == null) {
+          _logger.warn('Header extension entry is missing URI: $e');
+          return null;
+        }
+        
+        return RtpHeaderExtensionParameters(
+          uri: uri,
+          id: id,
+          encrypt: e['encrypt'] == true,
+        );
+      }).whereType<RtpHeaderExtensionParameters>().toList() ?? [];
+      
+      _logger.debug('Processed ${sendingRtpParameters.headerExtensions.length} header extensions');
+    } catch (error) {
+      _logger.error('Error processing header extensions: $error');
+      sendingRtpParameters.headerExtensions = [];
+    }
+    
+    sendingRtpParameters.mid = transceiver.mid;
+
+    return HandlerSendResult(
+      localId: transceiver.mid ?? '',
+      rtpParameters: sendingRtpParameters,
+      rtpSender: transceiver.sender,
+    );
   }
 
 

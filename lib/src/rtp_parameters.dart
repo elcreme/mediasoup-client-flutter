@@ -13,7 +13,7 @@ enum MediaKind {
 
 extension MediaKindExtension on MediaKind {
   String get value => toString().split('.').last;
-  
+
   static MediaKind fromString(String value) {
     return MediaKind.values.firstWhere(
       (kind) => kind.value == value,
@@ -101,7 +101,7 @@ extension RtpHeaderDirectionExtension on RtpHeaderDirection {
   }
 
   String get value => _directionToString[this] ?? 'sendrecv';
-  
+
   bool get canSend => this == RtpHeaderDirection.sendrecv || this == RtpHeaderDirection.sendonly;
   bool get canReceive => this == RtpHeaderDirection.sendrecv || this == RtpHeaderDirection.recvonly;
 }
@@ -136,7 +136,7 @@ extension RTCRtpMediaTypeExtension on RTCRtpMediaType {
 class RtcpFeedback {
   /// Feedback type (e.g., 'nack', 'ccm', 'transport-cc').
   final String type;
-  
+
   /// Feedback parameter (e.g., 'pli', 'fir').
   final String? parameter;
 
@@ -169,10 +169,10 @@ class RtcpFeedback {
            other.type == type && 
            other.parameter == parameter;
   }
-  
+
   @override
   int get hashCode => type.hashCode ^ (parameter?.hashCode ?? 0);
-  
+
   @override
   String toString() {
     return 'RtcpFeedback(type: $type, parameter: $parameter)';
@@ -458,6 +458,16 @@ class RtpHeaderExtensionParameters {
         encrypt = data['encrypt'] ?? false,
         parameters = Map<String, dynamic>.from(data['parameters'] ?? {});
 
+  // Added to support unified_plan.dart
+  static RtpHeaderExtensionParameters fromString(String uri) {
+    return RtpHeaderExtensionParameters(
+      uri: uri,
+      id: 0, // Dynamic ID assignment should be handled elsewhere
+      encrypt: false,
+      parameters: {},
+    );
+  }
+
   Map<String, dynamic> toMap() {
     return {
       'uri': uri,
@@ -617,7 +627,7 @@ class RtpCodecParameters {
   /// Codec clock rate expressed in Hertz.
   final int clockRate;
 
-  /// The number of channels supported (e.e two for stereo). Just for audio.
+  /// The number of channels supported (e.g. two for stereo). Just for audio.
   /// Default 1.
   final int? channels;
 
@@ -685,25 +695,25 @@ class RtpCodecParameters {
 /// forwarded verbatim through the consumer.
 ///
 /// The RTP receive parameters will always have their ssrc values randomly
-/// generated for all of its  encodings (and optional rtx: { ssrc: XXXX } if the
+/// generated for all of its encodings (and optional rtx: { ssrc: XXXX } if the
 /// endpoint supports RTX), regardless of the original RTP send parameters in
 /// the associated producer. This applies even if the producer's encodings have
 /// rid set.
 class RtpParameters {
   /// The MID RTP extension value as defined in the BUNDLE specification.
-  final String? mid;
+  String? mid;
 
   /// Media and RTX codecs in use.
-  final List<RtpCodecParameters> codecs;
+  List<RtpCodecParameters> codecs;
 
   /// RTP header extensions in use.
-  final List<RtpHeaderExtensionParameters> headerExtensions;
+  List<RtpHeaderExtensionParameters> headerExtensions;
 
   /// Transmitted RTP streams and their settings.
-  final List<RtpEncodingParameters> encodings;
+  List<RtpEncodingParameters> encodings;
 
   /// Parameters used for RTCP.
-  final RtcpParameters? rtcp;
+  RtcpParameters? rtcp;
 
   RtpParameters({
     this.mid,

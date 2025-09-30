@@ -54,19 +54,23 @@ class SctpParameters {
 	 */
   final int maxMessageSize;
 
+  final String? protocol;
+
   SctpParameters({
     this.port = 5000,
     required this.os,
     required this.mis,
     required this.maxMessageSize,
+    this.protocol = 'webrtc-datachannel',
   });
 
-  Map<String, int> toMap() {
+  Map<String, dynamic> toMap() { // Changed to dynamic to accommodate String
     return {
       'port': port,
       'OS': os,
       'MIS': mis,
       'maxMessageSize': maxMessageSize,
+      'protocol': protocol ?? 'webrtc-datachannel',
     };
   }
 
@@ -76,6 +80,7 @@ class SctpParameters {
       os: data['OS'],
       mis: data['MIS'],
       maxMessageSize: data['maxMessageSize'],
+      protocol: data['protocol'] as String?,
     );
   }
 }
