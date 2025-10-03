@@ -1,9 +1,11 @@
+/// UnifiedPlan handler implementing WebRTC Unified Plan SDP semantics for media negotiation.
+/// Handles transceiver management, codec negotiation, and SDP munging for WebRTC connections.
+
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:async';
 import 'dart:collection';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:js_util' as js_util;
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:sdp_transform/sdp_transform.dart';
 import 'package:mediasoup_client_flutter/src/ortc.dart';
@@ -17,18 +19,21 @@ import 'package:mediasoup_client_flutter/src/handlers/handler_interface.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/common_utils.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/media_section.dart';
 import 'package:mediasoup_client_flutter/src/handlers/sdp/remote_sdp.dart';
-import 'package:mediasoup_client_flutter/src/handlers/sdp/unified_plan_utils.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 
-// Helper function to safely extract values that might be wrapped in IdentityMap
-// Helper function to safely extract values
+Logger _logger = Logger('UnifiedPlan');
+
 dynamic _safeExtractValue(dynamic value) {
-  if (value == null) return null;
-  if (value is Map) return value.values.firstOrNull ?? value;
+  if (value == null) {
+    _logger.warn('_safeExtractValue() | Value is null');
+    return null;
+  }
+  if (value is Map) {
+    final extracted = value.values.firstOrNull ?? value;
+    _logger.debug('_safeExtractValue() | Extracted from Map: $extracted');
+    return extracted;
+  }
   return value;
 }
-
-Logger _logger = Logger('Unified plan handler');
 
 class UnifiedPlan extends HandlerInterface {
   late Direction _direction;
@@ -41,7 +46,6 @@ class UnifiedPlan extends HandlerInterface {
   bool _hasDataChannelMediaSection = false;
   int _nextSendSctpStreamId = 0;
   bool _transportReady = false;
-  ExtendedRtpCapabilities? _extendedRtpCapabilities;
 
   UnifiedPlan() : super();
 
@@ -49,28 +53,35 @@ class UnifiedPlan extends HandlerInterface {
     required DtlsRole localDtlsRole,
     Map<String, dynamic>? localSdpMap,
   }) async {
+    _logger.debug('_setupTransport() called with localDtlsRole: $localDtlsRole');
     if (localSdpMap == null) {
       final localDescription = await _pc!.getLocalDescription();
       localSdpMap = parse(localDescription!.sdp!);
+      _logger.debug('_setupTransport() parsed local SDP: $localSdpMap');
     }
 
-    // Get our local DTLS parameters.
     DtlsParameters dtlsParameters = CommonUtils.extractDtlsParameters(localSdpMap);
+    _logger.debug('_setupTransport() extracted DTLS parameters: ${dtlsParameters.toMap()}');
 
-    // Set our DTLS role.
     dtlsParameters.role = localDtlsRole;
+    _logger.debug('_setupTransport() set DTLS role: ${dtlsParameters.role}');
 
-    // Update the remote DTLC role in the SDP.
     _remoteSdp.updateDtlsRole(
       localDtlsRole == DtlsRole.client ? DtlsRole.server : DtlsRole.client,
     );
+    _logger.debug('_setupTransport() updated remote DTLS role');
 
-    // Need to tell the remote transport about our parameters.
-    await safeEmitAsFuture('@connect', {
+    safeEmit('@connect', {
       'dtlsParameters': dtlsParameters,
+      'callback': () {
+        _logger.debug('@connect callback invoked - transport connected');
+      }, 
+      'errback': (error) => _logger.error('connect error: $error'),
     });
+    _logger.debug('_setupTransport() @connect emitted successfully');
 
     _transportReady = true;
+    _logger.debug('_setupTransport() transportReady set to true');
   }
 
   void _assertSendDirection() {
@@ -114,11 +125,52 @@ class UnifiedPlan extends HandlerInterface {
       final parsedOffer = parse(offer.sdp!);
       
       RtpCapabilities nativeRtpCapabilities = CommonUtils.extractRtpCapabilities(parsedOffer);
+      _logger.debug('Extracted native RTP capabilities: codecs count = ${nativeRtpCapabilities.codecs.length}');
+
+      // Fallback: If no codecs extracted (e.g., parsing error), add defaults
+      if (nativeRtpCapabilities.codecs.isEmpty) {
+        _logger.warn('No codecs in native capabilities - adding fallbacks');
+        // Audio fallback: Opus
+        nativeRtpCapabilities.codecs.add(RtpCodecCapability(
+          kind: MediaKind.audio,
+          mimeType: 'audio/opus',
+          preferredPayloadType: 111,
+          clockRate: 48000,
+          channels: 2,
+          parameters: {'minptime': 10, 'useinbandfec': 1},
+          rtcpFeedback: [],
+        ));
+        // Video fallback: H264
+        nativeRtpCapabilities.codecs.add(RtpCodecCapability(
+          kind: MediaKind.video,
+          mimeType: 'video/H264',
+          preferredPayloadType: 96,
+          clockRate: 90000,
+          parameters: {'packetization-mode': 1, 'profile-level-id': '42e01f', 'level-asymmetry-allowed': 1},
+          rtcpFeedback: [
+            RtcpFeedback(type: 'nack'),
+            RtcpFeedback(type: 'nack', parameter: 'pli'),
+            RtcpFeedback(type: 'goog-remb'),
+          ],
+        ));
+        // RTX for video
+        nativeRtpCapabilities.codecs.add(RtpCodecCapability(
+          kind: MediaKind.video,
+          mimeType: 'video/rtx',
+          preferredPayloadType: 97,
+          clockRate: 90000,
+          parameters: {'apt': 96},
+          rtcpFeedback: [],
+        ));
+        _logger.debug('Added fallback codecs: now ${nativeRtpCapabilities.codecs.length} codecs');
+      }
+
       await pc.close();
       
       return nativeRtpCapabilities;
     } catch (error) {
       await pc.close();
+      _logger.error('Error getting native RTP capabilities: $error');
       throw error;
     }
   }
@@ -155,7 +207,7 @@ class UnifiedPlan extends HandlerInterface {
   }
 
   @override
-  String get name => 'Unified plan handler';
+  String get name => 'UnifiedPlan';
 
   @override
   Future<HandlerReceiveResult> receive(HandlerReceiveOptions options) async {
@@ -166,7 +218,7 @@ class UnifiedPlan extends HandlerInterface {
 
     _remoteSdp.receive(
       mid: localId,
-      kind: TypeConversion.rtcMediaTypeToString(options.kind),
+      kind: options.kind,
       offerRtpParameters: options.rtpParameters,
       streamId: options.rtpParameters.rtcp?.cname ?? '',
       trackId: options.trackId,
@@ -180,7 +232,6 @@ class UnifiedPlan extends HandlerInterface {
     RTCSessionDescription answer = await _pc!.createAnswer({});
     Map<String, dynamic> localSdpMap = parse(answer.sdp!);
 
-    // Find the media section by MID
     Map<String, dynamic>? answerMediaObject;
     for (var media in localSdpMap['media'] ?? []) {
       if (media['mid'] == localId) {
@@ -193,7 +244,6 @@ class UnifiedPlan extends HandlerInterface {
       throw ('Media section not found for mid: $localId');
     }
 
-    // Apply codec parameters
     CommonUtils.applyCodecParameters(options.rtpParameters, answerMediaObject);
 
     answer = RTCSessionDescription(write(localSdpMap, null), 'answer');
@@ -312,18 +362,17 @@ class UnifiedPlan extends HandlerInterface {
 
   @override
   void run({required HandlerRunOptions options}) async {
-    _logger.debug('run()');
+    _logger.debug('run() called with direction: ${options.direction}');
+    
     _direction = options.direction;
-    _extendedRtpCapabilities = options.extendedRtpCapabilities;
-
     _remoteSdp = RemoteSdp(
       iceParameters: options.iceParameters,
       iceCandidates: options.iceCandidates,
       dtlsParameters: options.dtlsParameters,
       sctpParameters: options.sctpParameters,
     );
+    _logger.debug('run() initialized RemoteSdp');
 
-    // Use TypeConversion consistently
     _sendingRtpParametersByKind = {
       RTCRtpMediaType.RTCRtpMediaTypeAudio: Ortc.getSendingRtpParameters(
         MediaKind.audio, 
@@ -335,6 +384,15 @@ class UnifiedPlan extends HandlerInterface {
       ),
     };
 
+    // CRITICAL: Validate codecs were created
+    _logger.debug('Sending RTP parameters map created with keys: ${_sendingRtpParametersByKind.keys.toList()}');
+    _sendingRtpParametersByKind.forEach((kind, params) {
+      _logger.debug('Kind $kind has ${params.codecs.length} codecs: ${params.codecs.map((c) => c.mimeType).join(", ")}');
+      if (params.codecs.isEmpty) {
+        _logger.error('FATAL: No codecs for kind $kind - extended capabilities may be incomplete');
+      }
+    });
+
     _sendingRemoteRtpParametersByKind = {
       RTCRtpMediaType.RTCRtpMediaTypeAudio: Ortc.getSendingRemoteRtpParameters(
         MediaKind.audio, 
@@ -345,11 +403,13 @@ class UnifiedPlan extends HandlerInterface {
         options.extendedRtpCapabilities!,
       ),
     };
+    _logger.debug('run() set _sendingRemoteRtpParametersByKind');
 
     if (options.dtlsParameters.role != DtlsRole.auto) {
       _forcedLocalDtlsRole = options.dtlsParameters.role == DtlsRole.server
           ? DtlsRole.client
           : DtlsRole.server;
+      _logger.debug('run() set _forcedLocalDtlsRole: $_forcedLocalDtlsRole');
     }
 
     final constraints = options.proprietaryConstraints.isEmpty
@@ -358,6 +418,7 @@ class UnifiedPlan extends HandlerInterface {
             'optional': [{'DtlsSrtpKeyAgreement': true}],
           }
         : options.proprietaryConstraints;
+    _logger.debug('run() using constraints: $constraints');
 
     _pc = await createPeerConnection(
       {
@@ -370,26 +431,34 @@ class UnifiedPlan extends HandlerInterface {
       },
       constraints,
     );
+    _logger.debug('run() created RTCPeerConnection');
 
     _pc!.onIceConnectionState = (RTCIceConnectionState state) {
       final stateStr = state.toString().split('.').last;
+      _logger.debug('run() ICE connection state changed: $stateStr');
       emit('@connectionstatechange', {'state': stateStr.toLowerCase()});
     };
   }
 
-    Future<DtlsParameters> getDtlsParameters() async {
-      _logger.debug('getDtlsParameters()');
-      final offer = await _pc!.createOffer({}); // Use Map for options
-      final localSdpObject = parse(offer.sdp ?? '');
-      final dtlsParameters = CommonUtils.extractDtlsParameters(localSdpObject);
-      dtlsParameters.role = DtlsRole.auto;
-      return dtlsParameters;
-    }
+  Future<DtlsParameters> getDtlsParameters() async {
+    _logger.debug('getDtlsParameters()');
+    final offer = await _pc!.createOffer({});
+    final localSdpObject = parse(offer.sdp ?? '');
+    final dtlsParameters = CommonUtils.extractDtlsParameters(localSdpObject);
+    dtlsParameters.role = DtlsRole.auto;
+    return dtlsParameters;
+  }
 
   @override
   Future<HandlerSendResult> send(HandlerSendOptions options) async {
     _assertSendDirection();
-    _logger.debug('send() [kind:${options.track.kind}, track.id:${options.track.id}, source:${options.source ?? 'unknown'}]');
+    
+    _logger.debug('send() [kind:${options.track.kind}, track.id:${options.track.id}]');
+
+    if (options.track == null) {
+      _logger.error('send() called with null track');
+      throw Exception('Track cannot be null');
+    }
 
     final track = options.track;
     final encodings = options.encodings;
@@ -397,139 +466,321 @@ class UnifiedPlan extends HandlerInterface {
     final codec = options.codec;
     final stream = options.stream;
 
-    if (encodings != null && encodings.length > 1) {
-      for (int idx = 0; idx < encodings.length; idx++) {
-        encodings[idx].rid = 'r$idx';
+    final rtcMediaType = track.kind == 'audio' 
+        ? RTCRtpMediaType.RTCRtpMediaTypeAudio 
+        : RTCRtpMediaType.RTCRtpMediaTypeVideo;
+    
+    final sourceParams = _sendingRtpParametersByKind[rtcMediaType];
+    if (sourceParams == null) {
+      _logger.error('No source parameters for: $rtcMediaType');
+      throw Exception('No RTP parameters available for $rtcMediaType');
+    }
+    
+    var sendingRtpParameters = RtpParameters(
+      mid: sourceParams.mid,
+      codecs: sourceParams.codecs.map((c) => RtpCodecParameters(
+        mimeType: c.mimeType,
+        payloadType: c.payloadType,
+        clockRate: c.clockRate,
+        channels: c.channels,
+        parameters: Map<String, dynamic>.from(c.parameters),
+        rtcpFeedback: c.rtcpFeedback.map((fb) => RtcpFeedback(
+          type: fb.type,
+          parameter: fb.parameter,
+        )).toList(),
+      )).toList(),
+      headerExtensions: sourceParams.headerExtensions.map((ext) => RtpHeaderExtensionParameters(
+        uri: ext.uri,
+        id: ext.id!,
+        encrypt: ext.encrypt ?? false,
+        parameters: Map<String, dynamic>.from(ext.parameters),
+      )).toList(),
+      encodings: sourceParams.encodings?.map((enc) => RtpEncodingParameters(
+        rid: enc.rid,
+        ssrc: enc.ssrc,
+        active: enc.active,
+        maxBitrate: enc.maxBitrate,
+        scaleResolutionDownBy: enc.scaleResolutionDownBy,
+        maxFramerate: enc.maxFramerate,
+        dtx: enc.dtx,
+        scalabilityMode: enc.scalabilityMode,
+      )).toList() ?? [],
+      rtcp: RtcpParameters(
+        cname: sourceParams.rtcp?.cname ?? 'webrtc-${(track.id ?? 'unknown').substring(0, math.min(8, (track.id ?? 'unknown').length))}',
+        reducedSize: sourceParams.rtcp?.reducedSize ?? true,
+        mux: sourceParams.rtcp?.mux ?? true,
+      ),
+    );
+    
+    _logger.debug('Codecs: ${sendingRtpParameters.codecs.length}, RTCP cname: ${sendingRtpParameters.rtcp?.cname}');
+
+    if (codec != null) {
+      sendingRtpParameters.codecs = [
+        RtpCodecParameters(
+          mimeType: codec.mimeType,
+          payloadType: codec.preferredPayloadType ?? 96,
+          clockRate: codec.clockRate,
+          channels: codec.channels,
+          parameters: Map<String, dynamic>.from(codec.parameters),
+          rtcpFeedback: codec.rtcpFeedback.map((fb) => RtcpFeedback(
+            type: fb.type,
+            parameter: fb.parameter,
+          )).toList(),
+        )
+      ];
+    }
+
+    List<RtpEncodingParameters> sanitizedEncodings;
+    
+    if (encodings == null || encodings.isEmpty) {
+      sanitizedEncodings = [
+        RtpEncodingParameters(
+          ssrc: (math.Random().nextDouble() * 4294967295).floor(),
+          active: true,
+          maxBitrate: rtcMediaType == RTCRtpMediaType.RTCRtpMediaTypeVideo ? 2000000 : 128000,
+        )
+      ];
+    } else {
+      sanitizedEncodings = encodings.asMap().entries.map((entry) {
+        final e = entry.value;
+        final idx = entry.key;
+        return RtpEncodingParameters(
+          rid: e.rid ?? (encodings.length > 1 ? 'r$idx' : null),
+          ssrc: e.ssrc ?? (math.Random().nextDouble() * 4294967295).floor(),
+          active: e.active ?? true,
+          maxBitrate: e.maxBitrate,
+          scaleResolutionDownBy: e.scaleResolutionDownBy,
+          maxFramerate: e.maxFramerate,
+        );
+      }).toList();
+    }
+
+    sendingRtpParameters.encodings = sanitizedEncodings;
+    
+    if (sendingRtpParameters.encodings!.length > 1) {
+      for (int idx = 0; idx < sendingRtpParameters.encodings!.length; idx++) {
+        if (sendingRtpParameters.encodings![idx].rid == null) {
+          sendingRtpParameters.encodings![idx] = RtpEncodingParameters(
+            rid: 'r$idx',
+            ssrc: sendingRtpParameters.encodings![idx].ssrc,
+            active: sendingRtpParameters.encodings![idx].active,
+            maxBitrate: sendingRtpParameters.encodings![idx].maxBitrate,
+            scaleResolutionDownBy: sendingRtpParameters.encodings![idx].scaleResolutionDownBy,
+            maxFramerate: sendingRtpParameters.encodings![idx].maxFramerate,
+          );
+        }
       }
     }
 
-    List<RTCRtpEncoding>? rtcEncodings;
-    if (encodings != null) {
-      rtcEncodings = encodings.map((e) => RTCRtpEncoding(
-            rid: e.rid,
-            active: e.active ?? true,
-            maxBitrate: e.maxBitrate,
-            maxFramerate: e.maxFramerate?.round(),
-            scaleResolutionDownBy: e.scaleResolutionDownBy,
-          )).toList();
+    List<RTCRtpEncoding> rtcEncodings = sendingRtpParameters.encodings!.map((encoding) {
+      if (encoding.ssrc == null) {
+        throw Exception('Encoding SSRC generation failed');
+      }
+      return RTCRtpEncoding(
+        rid: encoding.rid,
+        active: encoding.active ?? true,
+        maxBitrate: encoding.maxBitrate,
+        maxFramerate: encoding.maxFramerate?.round(),
+        scaleResolutionDownBy: encoding.scaleResolutionDownBy,
+        ssrc: encoding.ssrc,
+      );
+    }).toList();
+
+    _logger.debug('Creating transceiver with ${rtcEncodings.length} encodings');
+
+    if (_pc == null) {
+      throw Exception('Peer connection not initialized');
     }
 
-    final transceiver = await _pc!.addTransceiver(
-      track: track,
-      init: RTCRtpTransceiverInit(
-        direction: TransceiverDirection.SendOnly,
-        streams: [stream],
-        sendEncodings: rtcEncodings,
-      ),
-    );
+    RTCRtpTransceiver? transceiver;
+    try {
+      transceiver = await _pc!.addTransceiver(
+        track: track,
+        init: RTCRtpTransceiverInit(
+          direction: TransceiverDirection.SendOnly,
+          streams: stream != null ? [stream] : [],
+        ),
+      );
+      
+      if (transceiver == null) {
+        throw Exception('addTransceiver returned null');
+      }
+      
+      _logger.debug('Transceiver created successfully');
+    } catch (error, stackTrace) {
+      _logger.error('Failed to add transceiver: $error');
+      _logger.error('Stack: $stackTrace');
+      rethrow;
+    }
+
+    await Future.delayed(const Duration(milliseconds: 200));
 
     final offer = await _pc!.createOffer({});
     var localSdpObject = parse(offer.sdp ?? '');
 
-    Map<String, dynamic>? offerMediaObject = localSdpObject['media'].firstWhere(
-      (m) => m['mid'] == transceiver.mid && m['type'] == track.kind,
-      orElse: () => null,
-    );
-
-    if (offerMediaObject == null) {
-      throw Exception('No media section found for MID: ${transceiver.mid} and kind: ${track.kind}');
+    Map<String, dynamic>? offerMediaObject;
+    for (var media in localSdpObject['media'] ?? []) {
+      if (media['type'] == track.kind) {
+        offerMediaObject = media;
+        break;
+      }
     }
 
-    if (encodings != null) {
-      offerMediaObject['rtp'] = [];
-      offerMediaObject['fmtp'] = [];
-      for (var encoding in encodings) {
-        int pt = 96 + encodings.indexOf(encoding);
-        offerMediaObject['rtp'].add({
-          'payload': pt,
-          'codec': codec?.mimeType.split('/')[1] ?? 'VP8',
-          'rate': codec?.clockRate ?? 90000,
-        });
-        if (codecOptions != null) {
-          final params = codecOptions.toMap();
-          if (params.isNotEmpty) {
-            offerMediaObject['fmtp'].add({
-              'payload': pt,
-              'config': params.entries.map((e) => '${e.key}=${e.value}').join(';'),
-            });
-          }
-        }
-      }
-      offerMediaObject['payloads'] = offerMediaObject['rtp'].map((r) => r['payload']).join(' ');
+    if (offerMediaObject == null) {
+      throw Exception('No media section found for ${track.kind}');
     }
 
     if (codec != null) {
+      final codecName = codec.mimeType.split('/')[1].toLowerCase();
       offerMediaObject['rtp'] = [
-        ...offerMediaObject['rtp'].where((r) => r['codec'].toLowerCase() == codec.mimeType.split('/')[1].toLowerCase()),
-        ...offerMediaObject['rtp'].where((r) => r['codec'].toLowerCase() != codec.mimeType.split('/')[1].toLowerCase()),
+        ...offerMediaObject['rtp'].where((r) => r['codec'].toLowerCase() == codecName),
+        ...offerMediaObject['rtp'].where((r) => r['codec'].toLowerCase() != codecName),
       ];
       offerMediaObject['payloads'] = offerMediaObject['rtp'].map((r) => r['payload']).join(' ');
     }
 
     final modifiedSdp = write(localSdpObject, null);
     await _pc!.setLocalDescription(RTCSessionDescription(modifiedSdp, 'offer'));
-
-    final sendingRtpParameters = Ortc.getSendingRtpParameters(
-      TypeConversion.rtcToMediaKind(transceiver.sender.track!.kind == 'audio'
-          ? RTCRtpMediaType.RTCRtpMediaTypeAudio
-          : RTCRtpMediaType.RTCRtpMediaTypeVideo),
-      _extendedRtpCapabilities!,
-    );
-
-    // Handle extracted codecs and assign payloadType
-    final extractedCodecs = CommonUtils.extractRtpCapabilities(offerMediaObject).codecs;
-    final codecParameters = extractedCodecs.asMap().entries.map((entry) {
-      final c = entry.value;
-      return RtpCodecParameters(
-        mimeType: c.mimeType,
-        clockRate: c.clockRate,
-        payloadType: 96 + entry.key, // Assign dynamic payload type
-        channels: c.channels,
-        parameters: c.parameters,
-        rtcpFeedback: c.rtcpFeedback,
-      );
-    }).toList();
-
-    sendingRtpParameters.codecs = Ortc.reduceCodecs(codecParameters, codec);
-    sendingRtpParameters.encodings = encodings ?? [RtpEncodingParameters(scaleResolutionDownBy: 1.0)];
     
-    // Debug log the extensions before processing
-    _logger.debug('offerMediaObject[ext]: ${offerMediaObject['ext']}');
-    
-    try {
-      sendingRtpParameters.headerExtensions = (offerMediaObject['ext'] as List<dynamic>?)?.map((e) {
-        final uri = e['uri']?.toString();
-        final id = e['id'] is int ? e['id'] : int.tryParse(e['id']?.toString() ?? '0') ?? 0;
+    _logger.debug('Local description set, waiting for mid assignment...');
+
+    String? assignedMid;
+    for (int attempt = 0; attempt < 50; attempt++) {
+      await Future.delayed(const Duration(milliseconds: 100));
+      
+      try {
+        final currentMid = transceiver.mid;
         
-        if (uri == null) {
-          _logger.warn('Header extension entry is missing URI: $e');
-          return null;
+        _logger.debug('Attempt ${attempt + 1}: transceiver.mid = $currentMid (type: ${currentMid.runtimeType})');
+        
+        if (currentMid != null && currentMid.isNotEmpty && currentMid != 'null') {
+          assignedMid = currentMid;
+          _logger.debug('✅ MID assigned: $assignedMid (attempt ${attempt + 1})');
+          break;
+        }
+      } catch (e) {
+        _logger.warn('❌ Error reading mid (attempt ${attempt + 1}): $e');
+      }
+    }
+
+    if (assignedMid == null || assignedMid.isEmpty || assignedMid == 'null') {
+      _logger.warn('⚠️ MID not assigned by transceiver after 50 attempts, extracting from SDP');
+      
+      final currentLocal = await _pc!.getLocalDescription();
+      if (currentLocal != null) {
+        final parsedSdp = parse(currentLocal.sdp!);
+        
+        for (var media in parsedSdp['media'] ?? []) {
+          if (media['type'] == track.kind && media['mid'] != null) {
+            assignedMid = media['mid'].toString();
+            _logger.debug('✅ Extracted MID from SDP: $assignedMid');
+            break;
+          }
+        }
+      }
+      
+      if (assignedMid == null || assignedMid.isEmpty) {
+        throw Exception('❌ FATAL: Failed to get MID from transceiver or SDP');
+      }
+    }
+
+    sendingRtpParameters.codecs = Ortc.reduceCodecs(sendingRtpParameters.codecs, codec);
+    
+    // ⚡ CRITICAL FIX: Safe header extension parsing
+    _logger.debug('Parsing header extensions from SDP...');
+    try {
+      final extList = offerMediaObject['ext'];
+      _logger.debug('Raw ext list: $extList (type: ${extList.runtimeType})');
+      
+      if (extList != null && extList is List) {
+        final parsedExtensions = <RtpHeaderExtensionParameters>[];
+        
+        for (int i = 0; i < extList.length; i++) {
+          final e = extList[i];
+          _logger.debug('Parsing ext[$i]: $e (type: ${e.runtimeType})');
+          
+          if (e == null || e is! Map) {
+            _logger.warn('Skipping invalid ext[$i]: not a Map');
+            continue;
+          }
+          
+          final uri = e['uri'];
+          final id = e['value']; // Note: SDP parser uses 'value', not 'id'
+          
+          _logger.debug('ext[$i]: uri=$uri (${uri.runtimeType}), value=$id (${id.runtimeType})');
+          
+          if (uri == null || uri is! String) {
+            _logger.warn('Skipping ext[$i]: uri is null or not String');
+            continue;
+          }
+          
+          if (id == null) {
+            _logger.warn('Skipping ext[$i]: id/value is null');
+            continue;
+          }
+          
+          int? parsedId;
+          if (id is int) {
+            parsedId = id;
+          } else if (id is String) {
+            parsedId = int.tryParse(id);
+          } else {
+            try {
+              parsedId = int.parse(id.toString());
+            } catch (e) {
+              _logger.warn('Skipping ext[$i]: cannot parse id "$id" to int');
+              continue;
+            }
+          }
+          
+          if (parsedId == null) {
+            _logger.warn('Skipping ext[$i]: parsed id is null');
+            continue;
+          }
+          
+          parsedExtensions.add(RtpHeaderExtensionParameters(
+            uri: uri,
+            id: parsedId,
+            encrypt: false,
+          ));
+          
+          _logger.debug('✅ Added header extension: uri=$uri, id=$parsedId');
         }
         
-        return RtpHeaderExtensionParameters(
-          uri: uri,
-          id: id,
-          encrypt: e['encrypt'] == true,
-        );
-      }).whereType<RtpHeaderExtensionParameters>().toList() ?? [];
-      
-      _logger.debug('Processed ${sendingRtpParameters.headerExtensions.length} header extensions');
-    } catch (error) {
-      _logger.error('Error processing header extensions: $error');
+        sendingRtpParameters.headerExtensions = parsedExtensions;
+        _logger.debug('Parsed ${parsedExtensions.length} header extensions successfully');
+      } else {
+        _logger.warn('No header extensions found in offer media object (ext is null or not List)');
+        sendingRtpParameters.headerExtensions = [];
+      }
+    } catch (extError, stackTrace) {
+      _logger.error('❌ Error parsing header extensions: $extError');
+      _logger.error('Stack trace: $stackTrace');
+      _logger.error('offerMediaObject[ext]: ${offerMediaObject['ext']}');
       sendingRtpParameters.headerExtensions = [];
     }
     
-    sendingRtpParameters.mid = transceiver.mid;
+    sendingRtpParameters.mid = assignedMid;
+
+    if (!_transportReady) {
+      await _setupTransport(
+        localDtlsRole: _forcedLocalDtlsRole ?? DtlsRole.client,
+        localSdpMap: localSdpObject,
+      );
+    }
+
+    _mapMidTransceiver[assignedMid] = transceiver;
+
+    _logger.debug('send() completed: mid=$assignedMid, codecs=${sendingRtpParameters.codecs.length}, extensions=${sendingRtpParameters.headerExtensions.length}');
 
     return HandlerSendResult(
-      localId: transceiver.mid ?? '',
+      localId: assignedMid,
       rtpParameters: sendingRtpParameters,
       rtpSender: transceiver.sender,
     );
   }
 
-
-    @override
+  @override
   Future<HandlerSendDataChannelResult> sendDataChannel(SendDataChannelArguments options) async {
     _assertSendDirection();
 
@@ -550,7 +801,6 @@ class UnifiedPlan extends HandlerInterface {
       RTCSessionDescription offer = await _pc!.createOffer({});
       Map<String, dynamic> localSdpMap = parse(offer.sdp!);
       
-      // Find application media section
       Map<String, dynamic>? offerMediaObject;
       for (var media in localSdpMap['media'] ?? []) {
         if (media['type'] == 'application') {
@@ -569,7 +819,6 @@ class UnifiedPlan extends HandlerInterface {
       _logger.debug('sendDataChannel() | calling pc.setLocalDescription() [offer:${offer.toMap()}]');
       await _pc!.setLocalDescription(offer);
 
-      // Handle SCTP association in remote SDP
       if (offerMediaObject != null) {
         _remoteSdp.sendSctpAssociation(offerMediaObject);
       }
@@ -625,11 +874,11 @@ class UnifiedPlan extends HandlerInterface {
 
     int idx = 0;
     for (var encoding in parameters.encodings!) {
-    parameters.encodings![idx] = RTCRtpEncoding(
+      parameters.encodings![idx] = RTCRtpEncoding(
         active: options.params.active ?? encoding.active,
         maxBitrate: options.params.maxBitrate ?? encoding.maxBitrate,
         maxFramerate: options.params.maxFramerate != null 
-            ? options.params.maxFramerate!.round() // Convert to int
+            ? options.params.maxFramerate!.round()
             : encoding.maxFramerate?.round(),
         minBitrate: options.params.minBitrate ?? encoding.minBitrate,
         numTemporalLayers: options.params.numTemporalLayers ?? encoding.numTemporalLayers,
@@ -653,8 +902,7 @@ class UnifiedPlan extends HandlerInterface {
 
     await transceiver.setDirection(TransceiverDirection.Inactive);
     
-    dynamic midValue = transceiver.mid;
-    String midString = _safeExtractValue(midValue)?.toString() ?? '0';
+    String midString = _safeExtractValue(transceiver.mid)?.toString() ?? '0';
     
     _remoteSdp.closeMediaSection(midString);
 
@@ -674,36 +922,66 @@ class UnifiedPlan extends HandlerInterface {
     _assertSendDirection();
     _logger.debug('stopSending() [localId:$localId]');
 
-    RTCRtpTransceiver? transceiver = _mapMidTransceiver[localId];
-    if (transceiver == null) throw ('associated RTCRtpTransceiver not found');
+    // ✅ FIX: Add null check for localId
+    if (localId == null || localId.isEmpty) {
+      _logger.error('stopSending() called with null or empty localId');
+      throw Exception('localId cannot be null or empty');
+    }
 
+    RTCRtpTransceiver? transceiver = _mapMidTransceiver[localId];
+    if (transceiver == null) {
+      _logger.error('stopSending() | transceiver not found for localId: $localId');
+      throw Exception('associated RTCRtpTransceiver not found');
+    }
+
+    // ✅ FIX: Safe mid extraction
+    String? midValue = _safeExtractValue(transceiver.mid)?.toString();
+    
+    if (midValue == null || midValue.isEmpty || midValue == 'null') {
+      _logger.warn('stopSending() | mid is null, using localId as fallback: $localId');
+      midValue = localId;
+    }
+    
+    _logger.debug('stopSending() | Using mid: $midValue for transceiver');
+
+    // Remove track
     await _pc!.removeTrack(transceiver.sender);
     
-    dynamic midValue = transceiver.mid;
-    String midString = _safeExtractValue(midValue)?.toString() ?? '0';
-    
-    _remoteSdp.closeMediaSection(midString);
+    // ✅ FIX: Close media section with validated mid
+    try {
+      _remoteSdp.closeMediaSection(midValue);
+      _logger.debug('stopSending() | Media section closed for mid: $midValue');
+    } catch (error) {
+      _logger.error('stopSending() | Failed to close media section: $error');
+      // Continue anyway - don't let SDP error block cleanup
+    }
 
+    // Generate new offer
     RTCSessionDescription offer = await _pc!.createOffer({});
-    _logger.debug('stopSending() | calling pc.setLocalDescription() [offer:${offer.toMap()}]');
+    _logger.debug('stopSending() | calling pc.setLocalDescription()');
     await _pc!.setLocalDescription(offer);
 
+    // Generate answer
     RTCSessionDescription answer = RTCSessionDescription(_remoteSdp.getSdp(), 'answer');
-    _logger.debug('stopSending() | calling pc.setRemoteDescription() [answer:${answer.toMap()}]');
-    await _pc!.setRemoteDescription(answer);
+    _logger.debug('stopSending() | calling pc.setRemoteDescription()');
+    
+    try {
+      await _pc!.setRemoteDescription(answer);
+      _logger.debug('stopSending() | Remote description set successfully');
+    } catch (error) {
+      _logger.error('stopSending() | setRemoteDescription failed: $error');
+      _logger.error('stopSending() | Answer SDP: ${answer.sdp}');
+      throw Exception('Failed to set remote description: $error');
+    }
     
     _mapMidTransceiver.remove(localId);
+    _logger.debug('stopSending() | Completed for localId: $localId');
   }
-
   @override
   Future<void> updateIceServers(List<RTCIceServer> iceServers) async {
     _logger.debug('updateIceServers()');
     
     try {
-      // For flutter_webrtc, we need to use a different approach
-      // since getConfiguration() might not be available directly
-      
-      // Create a configuration map instead of using RTCConfiguration class
       final config = <String, dynamic>{
         'iceServers': iceServers.map((server) => server.toMap()).toList(),
         'iceTransportPolicy': 'all',
@@ -715,8 +993,6 @@ class UnifiedPlan extends HandlerInterface {
       await _pc!.setConfiguration(config);
     } catch (error) {
       _logger.error('updateIceServers() failed: $error');
-      // In some WebRTC implementations, updating ice servers might not be supported
-      // after peer connection creation. This is not a critical error.
       _logger.warn('Ice servers update might not be fully supported: $error');
     }
   }

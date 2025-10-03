@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:mediasoup_client_flutter/src/consumer.dart';
 import 'package:mediasoup_client_flutter/src/data_consumer.dart';
@@ -157,8 +159,6 @@ class IceCandidate {
   /// multiple transports.
   var foundation;
 
-  // String foundation;
-
   ///The assigned priority of the candidate.
   int priority;
 
@@ -209,7 +209,6 @@ class IceCandidate {
   IceCandidate.fromMap(Map data)
       : component = data['component'] ?? 1,
         foundation = data['foundation'],
-        // foundation = data['foundation'] is int ? data['foundation'] : data['foundation'].substring(0,3);
         ip = data['ip'],
         port = data['port'],
         priority = data['priority'],
@@ -363,7 +362,7 @@ class PlainRtpParameters {
   int get ipVersion => _ipVersion;
 
   set ipVersion(int ip) {
-    if (ip != 4 || ip != 6) {
+    if (ip != 4 && ip != 6) {
       throw 'only 4 or 6';
     }
     _ipVersion = ip;
@@ -374,7 +373,7 @@ class PlainRtpParameters {
     required this.port,
     required int ipVersion,
   })  : this._ipVersion = ipVersion,
-        assert(ipVersion != 4 || ipVersion != 6, 'Only 4 or 6');
+        assert(ipVersion == 4 || ipVersion == 6, 'Only 4 or 6');
 }
 
 Logger _logger = Logger('Transport');
@@ -526,7 +525,6 @@ class Transport extends EnhancedEventEmitter {
         iceParameters: iceParameters,
         iceCandidates: iceCandidates,
         dtlsParameters: dtlsParameters,
-        // SCTP parameters validation is handled internally
         iceServers: iceServers,
         iceTransportPolicy: iceTransportPolicy,
         additionalSettings: additionalSettings,
@@ -543,7 +541,7 @@ class Transport extends EnhancedEventEmitter {
   void _handleHandler() {
     HandlerInterface handler = _handler;
 
-    _handler.on(
+    handler.safeOn(
       '@connect',
       (Map data) {
         if (_closed) {
@@ -566,7 +564,7 @@ class Transport extends EnhancedEventEmitter {
       },
     );
 
-    handler.on(
+    handler.safeOn(
       '@connectionstatechange',
       (Map data) {
         String connectionState = data['state'];
@@ -629,8 +627,6 @@ class Transport extends EnhancedEventEmitter {
     _logger.debug('close()');
 
     _closed = true;
-
-    // TODO: close task handler.
 
     // Close the handler.
     await _handler.close();
@@ -826,71 +822,82 @@ class Transport extends EnhancedEventEmitter {
   }
 
   Future<void> _produce(ProduceArguments arguments) async {
-  try {
-    List<RtpEncodingParameters> normalizedEncodings = [];
-
-    if (arguments.encodings != null && arguments.encodings.isNotEmpty) {
-      // FIX: Remove the problematic normalizedEncoding reference
-      normalizedEncodings = List<RtpEncodingParameters>.from(arguments.encodings);
-    }
-
-    HandlerSendResult sendResult = await _handler.send(HandlerSendOptions(
-      track: arguments.track,
-      stream: arguments.stream,
-      encodings: normalizedEncodings,
-      codecOptions: arguments.codecOptions,
-      codec: arguments.codec,
-      kind: RTCRtpMediaTypeExtension.fromString(arguments.track.kind!), 
-    ));
-
     try {
-      // This will fill rtpParameters's missing fields with default values.
-      Ortc.validateRtpParameters(sendResult.rtpParameters);
+      List<RtpEncodingParameters> normalizedEncodings = [];
 
-      String id = await safeEmitAsFuture('produce', {
-        'kind': arguments.track.kind,
-        'rtpParameters': sendResult.rtpParameters,
-        'appData': arguments.appData,
-      });
+      if (arguments.encodings.isNotEmpty) {
+        normalizedEncodings = List<RtpEncodingParameters>.from(arguments.encodings);
+      }
 
-      Producer producer = Producer(
-        id: id,
-        localId: sendResult.localId,
-        rtpSender: sendResult.rtpSender,
+      HandlerSendResult sendResult = await _handler.send(HandlerSendOptions(
         track: arguments.track,
-        rtpParameters: sendResult.rtpParameters,
-        stopTracks: arguments.stopTracks,
-        disableTrackOnPause: arguments.disableTrackOnPause,
-        zeroRtpOnPause: arguments.zeroRtpOnPause,
-        appData: arguments.appData,
         stream: arguments.stream,
-        source: arguments.source,
-      );
+        encodings: normalizedEncodings,
+        codecOptions: arguments.codecOptions,
+        codec: arguments.codec,
+        kind: RTCRtpMediaTypeExtension.fromString(arguments.track.kind!),
+      ));
 
-      _producers[producer.id] = producer;
-      _handleProducer(producer);
+      // Give browser time to fully process the transceiver
+      await Future.delayed(const Duration(milliseconds: 200));
 
-      // Emit observer event.
-      _observer.safeEmit('newProducer', {
-        'producer': producer,
-      });
+      try {
+        // This will fill rtpParameters's missing fields with default values.
+        Ortc.validateRtpParameters(sendResult.rtpParameters);
 
-      producerCallback?.call(producer);
+        String id = await Future.any([
+          Future(() async {
+            final completer = Completer<String>();
+            safeEmit('produce', {
+              'kind': arguments.track.kind,
+              'rtpParameters': sendResult.rtpParameters,
+              'appData': arguments.appData,
+              'callback': (String id) => completer.complete(id),
+              'errback': (dynamic error) => completer.completeError(error),
+            });
+            return completer.future;
+          }),
+          Future.delayed(Duration(seconds: 10), () => throw TimeoutException('Produce event timed out')),
+        ]);
+
+        Producer producer = Producer(
+          id: id,
+          localId: sendResult.localId,
+          rtpSender: sendResult.rtpSender,
+          track: arguments.track,
+          rtpParameters: sendResult.rtpParameters,
+          stopTracks: arguments.stopTracks,
+          disableTrackOnPause: arguments.disableTrackOnPause,
+          zeroRtpOnPause: arguments.zeroRtpOnPause,
+          appData: arguments.appData,
+          stream: arguments.stream,
+          source: arguments.source,
+        );
+
+        _producers[producer.id] = producer;
+        _handleProducer(producer);
+
+        // Emit observer event.
+        _observer.safeEmit('newProducer', {
+          'producer': producer,
+        });
+
+        producerCallback?.call(producer);
+      } catch (error) {
+        _handler.stopSending(sendResult.localId);
+        throw error;
+      }
     } catch (error) {
-      _handler.stopSending(sendResult.localId);
+      // This catch is needed to stop the given track if the command above
+      // failed due to closed Transport.
+      if (arguments.stopTracks) {
+        try {
+          arguments.track.stop();
+        } catch (error2) {}
+      }
       throw error;
     }
-  } catch (error) {
-    // This catch is needed to stop the given track if the command above
-    // failed due to closed Transport.
-    if (arguments.stopTracks) {
-      try {
-        arguments.track.stop();
-      } catch (error2) {}
-    }
-    throw error;
   }
-}
 
   /// Create a Producer.
   /// use producerCallback to receive a new Producer.
@@ -941,7 +948,7 @@ class Transport extends EnhancedEventEmitter {
   }
 
   Future<void> _consume(ConsumeArguments arguments) async {
-    // Unsure the device can consume it.
+    // Ensure the device can consume it.
     bool canConsume = _extendedRtpCapabilities != null &&
         Ortc.canReceive(arguments.rtpParameters, _extendedRtpCapabilities!);
 
@@ -1027,22 +1034,20 @@ class Transport extends EnhancedEventEmitter {
       throw ('no "connect" listener set into this transport');
     }
 
-    _flexQueue.addTask(
-      FlexTaskAdd(
+    _flexQueue.addTask(FlexTaskAdd(
+      id: id,
+      message: 'transport.consume()',
+      execFun: _consume,
+      argument: ConsumeArguments(
         id: id,
-        message: 'transport.consume()',
-        execFun: _consume,
-        argument: ConsumeArguments(
-          id: id,
-          producerId: producerId,
-          kind: kind,
-          rtpParameters: rtpParameters,
-          appData: appData,
-          accept: accept,
-          peerId: peerId,
-        ),
+        producerId: producerId,
+        kind: kind,
+        rtpParameters: rtpParameters,
+        appData: appData,
+        accept: accept,
+        peerId: peerId,
       ),
-    );
+    ));
   }
 
   /// Create a DataProducer
@@ -1092,12 +1097,21 @@ class Transport extends EnhancedEventEmitter {
           Ortc.validateSctpStreamParameters(
               sendDataResult.sctpStreamParameters);
 
-          String id = await safeEmitAsFuture('producedata', {
-            'sctpStreamParameters': sendDataResult.sctpStreamParameters,
-            'label': label,
-            'protocol': protocol,
-            'appData': appData,
-          });
+          String id = await Future.any([
+            Future(() async {
+              final completer = Completer<String>();
+              safeEmit('producedata', {
+                'sctpStreamParameters': sendDataResult.sctpStreamParameters,
+                'label': label,
+                'protocol': protocol,
+                'appData': appData,
+                'callback': (String id) => completer.complete(id),
+                'errback': (dynamic error) => completer.completeError(error),
+              });
+              return completer.future;
+            }),
+            Future.delayed(Duration(seconds: 10), () => throw TimeoutException('ProduceData event timed out')),
+          ]);
 
           DataProducer dataProducer = DataProducer(
             id: id,

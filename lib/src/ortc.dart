@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:collection/collection.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:mediasoup_client_flutter/src/common/logger.dart';
 import 'package:mediasoup_client_flutter/src/rtp_parameters.dart';
 import 'package:mediasoup_client_flutter/src/sctp_parameters.dart';
 import 'package:mediasoup_client_flutter/src/type_conversion.dart';
@@ -227,7 +228,7 @@ class Ortc {
   static RtcpParameters validateRtcpParameters(RtcpParameters rtcp) {
     // reducedSize is optional. If unset set it to true.
     bool reducedSize = rtcp.reducedSize ?? true;
-    
+
     // mux is optional. If unset set it to true.
     bool mux = rtcp.mux ?? true;
 
@@ -335,18 +336,23 @@ class Ortc {
     bool strict = false,
     bool modify = false,
   }) {
+    final logger = Logger('Ortc:matchCodecs');
     String aMimeType = aCodec.mimeType.toLowerCase();
     String bMimeType = bCodec.mimeType.toLowerCase();
 
     if (aMimeType != bMimeType) {
+      logger.debug('MimeType mismatch: $aMimeType != $bMimeType');
       return false;
     }
 
     if (aCodec.clockRate != bCodec.clockRate) {
+      logger.debug('clockRate mismatch: ${aCodec.clockRate} != ${bCodec.clockRate}');
       return false;
     }
 
-    if (aCodec.channels != bCodec.channels) {
+    // Only compare channels for audio codecs
+    if (aMimeType.startsWith('audio/') && aCodec.channels != bCodec.channels) {
+      logger.debug('channels mismatch for audio codec: ${aCodec.channels} != ${bCodec.channels}');
       return false;
     }
 
@@ -358,12 +364,15 @@ class Ortc {
           var bPacketizationMode = bCodec.parameters['packetization-mode'] ?? 0;
 
           if (aPacketizationMode != bPacketizationMode) {
+            logger.debug('H264 packetization-mode mismatch: $aPacketizationMode != $bPacketizationMode');
             return false;
           }
 
           // If strict matching check profile-level-id.
           if (strict) {
-            if (!H264Utils.isSameProfile(aCodec.parameters, bCodec.parameters)) {
+            final isSame = H264Utils.isSameProfile(aCodec.parameters, bCodec.parameters);
+            if (!isSame) {
+              logger.debug('H264 profile not same. aParams: ${aCodec.parameters}, bParams: ${bCodec.parameters}');
               return false;
             }
 
@@ -374,13 +383,15 @@ class Ortc {
                 local_supported_params: aCodec.parameters,
                 remote_offered_params: bCodec.parameters,
               );
+              logger.debug('H264 generateProfileLevelIdForAnswer succeeded: $selectedProfileLevelId');
             } catch (error) {
+              logger.error('H264 generateProfileLevelIdForAnswer failed: $error');
               return false;
             }
 
             if (modify) {
-              // Note: We can't modify immutable objects, so this would need to be handled differently
-              // by creating new objects with the modified parameters
+              aCodec.parameters['profile-level-id'] = selectedProfileLevelId;
+              logger.debug('Modified aCodec profile-level-id to $selectedProfileLevelId');
             }
           }
           break;
@@ -394,6 +405,7 @@ class Ortc {
             var bProfileId = bCodec.parameters['profile-id'] ?? 0;
 
             if (aProfileId != bProfileId) {
+              logger.debug('VP9 profile-id mismatch: $aProfileId != $bProfileId');
               return false;
             }
           }
@@ -437,70 +449,89 @@ class Ortc {
     RtpCapabilities localCaps,
     RtpCapabilities remoteCaps,
   ) {
+    final logger = Logger('Ortc:getExtendedRtpCapabilities');
+    logger.debug('Starting getExtendedRtpCapabilities with local codecs: ${localCaps.codecs.length}, remote codecs: ${remoteCaps.codecs.length}');
+
+    // Log local and remote codecs for debugging
+    logger.debug('Local codecs: ${localCaps.codecs.map((c) => c.mimeType).join(', ')}');
+    logger.debug('Remote codecs: ${remoteCaps.codecs.map((c) => c.mimeType).join(', ')}');
+
     final extendedRtpCapabilities = ExtendedRtpCapabilities(
       codecs: [],
       headerExtensions: [],
     );
 
     // Match media codecs and keep the order preferred by remoteCaps.
-    for (RtpCodecCapability remoteCodec in remoteCaps.codecs) {
-      if (isRtxCodec(remoteCodec)) {
-        continue;
-      }
+    for (RtpCodecCapability localCodec in localCaps.codecs) {
+      logger.debug('Trying to match local codec: ${localCodec.mimeType} (clockRate: ${localCodec.clockRate}, channels: ${localCodec.channels})');
 
-      final RtpCodecCapability? matchingLocalCodec = localCaps.codecs.firstWhereOrNull(
-        (localCodec) => matchCodecs(aCodec: localCodec, bCodec: remoteCodec, strict: true, modify: true),
+      final matchingRemoteCodec = remoteCaps.codecs.firstWhereOrNull(
+        (remoteCodec) {
+          final match = matchCodecs(aCodec: localCodec, bCodec: remoteCodec, strict: true, modify: true);
+          if (match) {
+            logger.debug('Matched with remote codec: ${remoteCodec.mimeType}');
+          } else {
+            logger.debug('No match with remote codec: ${remoteCodec.mimeType} (clockRate mismatch or other)');
+          }
+          return match;
+        },
       );
 
-      if (matchingLocalCodec == null) {
+      if (matchingRemoteCodec == null) {
+        logger.debug('No match for local codec: ${localCodec.mimeType}');
         continue;
       }
 
       final extendedCodec = ExtendedRtpCodec(
-        kind: TypeConversion.mediaKindToRtc(matchingLocalCodec.kind),
-        mimeType: matchingLocalCodec.mimeType,
-        clockRate: matchingLocalCodec.clockRate,
-        channels: matchingLocalCodec.channels,
-        rtcpFeedback: reduceRtcpFeedback(matchingLocalCodec, remoteCodec),
-        localPayloadType: matchingLocalCodec.preferredPayloadType,
+        kind: TypeConversion.mediaKindToRtc(localCodec.kind),
+        mimeType: matchingRemoteCodec.mimeType,
+        clockRate: matchingRemoteCodec.clockRate,
+        channels: matchingRemoteCodec.channels,
+        localPayloadType: localCodec.preferredPayloadType,
         localRtxPayloadType: null,
-        remotePayloadType: remoteCodec.preferredPayloadType,
+        remotePayloadType: matchingRemoteCodec.preferredPayloadType,
         remoteRtxPayloadType: null,
-        localParameters: Map<String, dynamic>.from(matchingLocalCodec.parameters),
-        remoteParameters: Map<String, dynamic>.from(remoteCodec.parameters),
+        localParameters: Map.from(localCodec.parameters),
+        remoteParameters: Map.from(matchingRemoteCodec.parameters),
+        rtcpFeedback: reduceRtcpFeedback(localCodec, matchingRemoteCodec),
       );
 
       extendedRtpCapabilities.codecs.add(extendedCodec);
+      logger.debug('Extended codec added: ${extendedCodec.mimeType} (localPT: ${extendedCodec.localPayloadType}, remotePT: ${extendedCodec.remotePayloadType})');
     }
 
     // Match RTX codecs.
     for (ExtendedRtpCodec extendedCodec in extendedRtpCapabilities.codecs) {
-      final RtpCodecCapability? matchingLocalRtxCodec = localCaps.codecs.firstWhereOrNull(
+      final matchingLocalRtxCodec = localCaps.codecs.firstWhereOrNull(
         (localCodec) => isRtxCodec(localCodec) && localCodec.parameters['apt'] == extendedCodec.localPayloadType,
       );
 
-      final RtpCodecCapability? matchingRemoteRtxCodec = remoteCaps.codecs.firstWhereOrNull(
+      final matchingRemoteRtxCodec = remoteCaps.codecs.firstWhereOrNull(
         (remoteCodec) => isRtxCodec(remoteCodec) && remoteCodec.parameters['apt'] == extendedCodec.remotePayloadType,
       );
 
       if (matchingLocalRtxCodec != null && matchingRemoteRtxCodec != null) {
         extendedCodec.localRtxPayloadType = matchingLocalRtxCodec.preferredPayloadType;
         extendedCodec.remoteRtxPayloadType = matchingRemoteRtxCodec.preferredPayloadType;
+        logger.debug('Added RTX for codec ${extendedCodec.mimeType}: localRtxPT=${extendedCodec.localRtxPayloadType}, remoteRtxPT=${extendedCodec.remoteRtxPayloadType}');
+      } else {
+        logger.warn('No RTX match for codec: ${extendedCodec.mimeType}');
       }
     }
 
     // Match header extensions.
-    for (RtpHeaderExtension remoteExt in remoteCaps.headerExtensions) {
-      final RtpHeaderExtension? matchingLocalExt = localCaps.headerExtensions.firstWhereOrNull(
-        (localExt) => matchHeaderExtensions(localExt, remoteExt),
+    for (RtpHeaderExtension localExt in localCaps.headerExtensions) {
+      final matchingRemoteExt = remoteCaps.headerExtensions.firstWhereOrNull(
+        (remoteExt) => matchHeaderExtensions(localExt, remoteExt),
       );
 
-      if (matchingLocalExt == null) {
+      if (matchingRemoteExt == null) {
+        logger.debug('No match for local header extension: ${localExt.uri}');
         continue;
       }
 
       var direction = RtpHeaderDirection.sendrecv;
-      switch (remoteExt.direction) {
+      switch (matchingRemoteExt.direction) {
         case RtpHeaderDirection.recvonly:
           direction = RtpHeaderDirection.sendonly;
           break;
@@ -517,15 +548,22 @@ class Ortc {
       }
 
       var extendedExt = ExtendedRtpHeaderExtension(
-        kind: TypeConversion.mediaKindToRtc(remoteExt.kind!),
-        uri: remoteExt.uri,
-        sendId: matchingLocalExt.preferredId!,
-        recvId: remoteExt.preferredId!,
-        encrypt: matchingLocalExt.preferredEncrypt ?? false,
+        kind: localExt.kind != null ? TypeConversion.mediaKindToRtc(localExt.kind!) : RTCRtpMediaType.RTCRtpMediaTypeAudio,
+        uri: localExt.uri,
+        sendId: localExt.preferredId!,
+        recvId: matchingRemoteExt.preferredId!,
+        encrypt: localExt.preferredEncrypt ?? false,
         direction: direction,
       );
 
       extendedRtpCapabilities.headerExtensions.add(extendedExt);
+      logger.debug('Extended header extension added: ${extendedExt.uri} (sendId: ${extendedExt.sendId}, recvId: ${extendedExt.recvId})');
+    }
+
+    // Log final extended capabilities
+    logger.debug('Final extended codecs count: ${extendedRtpCapabilities.codecs.length}');
+    if (extendedRtpCapabilities.codecs.isEmpty) {
+      logger.error('No extended codecs generated - check local/remote capabilities mismatch');
     }
 
     return extendedRtpCapabilities;
@@ -630,6 +668,9 @@ class Ortc {
     MediaKind kind,
     ExtendedRtpCapabilities extendedRtpCapabilities,
   ) {
+    final logger = Logger('Ortc:getSendingRemoteRtpParameters');
+    logger.debug('Starting getSendingRemoteRtpParameters for kind: ${kind.value}');
+
     final rtpParameters = RtpParameters(
       mid: null,
       codecs: [],
@@ -639,7 +680,8 @@ class Ortc {
     );
 
     for (ExtendedRtpCodec extendedCodec in extendedRtpCapabilities.codecs) {
-      if (extendedCodec.kind != kind) {
+      if (extendedCodec.kind != TypeConversion.mediaKindToRtc(kind)) {
+        logger.debug('Skipping codec with mismatched kind: ${extendedCodec.mimeType} (expected: ${kind.value})');
         continue;
       }
 
@@ -653,6 +695,7 @@ class Ortc {
       );
 
       rtpParameters.codecs.add(codec);
+      logger.debug('Added codec: ${codec.mimeType} (payloadType: ${codec.payloadType})');
 
       // Add RTX codec.
       if (extendedCodec.localRtxPayloadType != null) {
@@ -665,14 +708,16 @@ class Ortc {
         );
 
         rtpParameters.codecs.add(rtxCodec);
+        logger.debug('Added RTX codec for ${codec.mimeType} (payloadType: ${rtxCodec.payloadType})');
       }
     }
 
     for (ExtendedRtpHeaderExtension extendedExtension in extendedRtpCapabilities.headerExtensions) {
       // Ignore RTP extensions of a different kind and those not valid for sending.
-      if ((extendedExtension.kind != null && extendedExtension.kind != kind) ||
+      if ((extendedExtension.kind != null && extendedExtension.kind != TypeConversion.mediaKindToRtc(kind)) ||
           (extendedExtension.direction != RtpHeaderDirection.sendrecv &&
               extendedExtension.direction != RtpHeaderDirection.sendonly)) {
+        logger.debug('Skipping header extension: ${extendedExtension.uri} (mismatched kind/direction)');
         continue;
       }
 
@@ -684,6 +729,7 @@ class Ortc {
       );
 
       rtpParameters.headerExtensions.add(ext);
+      logger.debug('Added header extension: ${ext.uri} (id: ${ext.id})');
     }
 
     // Reduce codecs' RTCP feedback. Use Transport-CC if available, REMB otherwise.
@@ -711,12 +757,21 @@ class Ortc {
       );
     }
 
+    // Log final parameters
+    logger.debug('Final RTP parameters codecs count: ${rtpParameters.codecs.length}');
+    if (rtpParameters.codecs.isEmpty) {
+      logger.error('No codecs generated for remote parameters - this may cause issues');
+    }
+
     return rtpParameters;
   }
 
   /// Generate RTP capabilities for receiving media based on the given extended
   /// RTP capabilities.
   static RtpCapabilities getRecvRtpCapabilities(ExtendedRtpCapabilities extendedRtpCapabilities) {
+    final logger = Logger('Ortc:getRecvRtpCapabilities');
+    logger.debug('Starting getRecvRtpCapabilities with codecs: ${extendedRtpCapabilities.codecs.length}');
+
     final rtpCapabilities = RtpCapabilities(
       codecs: [],
       headerExtensions: [],
@@ -735,6 +790,7 @@ class Ortc {
       );
 
       rtpCapabilities.codecs.add(codec);
+      logger.debug('Added codec: ${codec.mimeType} (payloadType: ${codec.preferredPayloadType})');
 
       // Add RTX codec.
       if (extendedCodec.remoteRtxPayloadType != null) {
@@ -749,6 +805,7 @@ class Ortc {
         );
 
         rtpCapabilities.codecs.add(rtxCodec);
+        logger.debug('Added RTX codec for ${codec.mimeType} (payloadType: ${rtxCodec.preferredPayloadType})');
       }
     }
 
@@ -756,11 +813,12 @@ class Ortc {
       // Ignore RTP extensions not valid for receiving.
       if (extendedExtension.direction != RtpHeaderDirection.sendrecv &&
           extendedExtension.direction != RtpHeaderDirection.recvonly) {
+        logger.debug('Skipping header extension: ${extendedExtension.uri} (not valid for receiving)');
         continue;
       }
 
       final ext = RtpHeaderExtension(
-          kind: TypeConversion.stringToMediaKind(TypeConversion.rtcMediaTypeToString(extendedExtension.kind)),
+        kind: TypeConversion.rtcToMediaKind(extendedExtension.kind),
         uri: extendedExtension.uri,
         preferredId: extendedExtension.recvId,
         preferredEncrypt: extendedExtension.encrypt,
@@ -768,8 +826,10 @@ class Ortc {
       );
 
       rtpCapabilities.headerExtensions.add(ext);
+      logger.debug('Added header extension: ${ext.uri} (id: ${ext.preferredId})');
     }
 
+    logger.debug('Final receive codecs count: ${rtpCapabilities.codecs.length}');
     return rtpCapabilities;
   }
 
@@ -778,6 +838,9 @@ class Ortc {
     MediaKind kind,
     ExtendedRtpCapabilities extendedRtpCapabilities,
   ) {
+    final logger = Logger('Ortc:getSendingRtpParameters');
+    logger.debug('Starting getSendingRtpParameters for kind: ${kind.value}');
+
     final rtpParameters = RtpParameters(
       mid: null,
       codecs: [],
@@ -786,8 +849,12 @@ class Ortc {
       rtcp: RtcpParameters(cname: '', reducedSize: true, mux: true),
     );
 
+    // Log incoming extended capabilities
+    logger.debug('Extended RTP capabilities codecs count: ${extendedRtpCapabilities.codecs.length}');
+
     for (ExtendedRtpCodec extendedCodec in extendedRtpCapabilities.codecs) {
-      if (extendedCodec.kind != kind) {
+      if (extendedCodec.kind != TypeConversion.mediaKindToRtc(kind)) {
+        logger.debug('Skipping codec with mismatched kind: ${extendedCodec.mimeType} (expected: ${kind.value})');
         continue;
       }
 
@@ -801,8 +868,9 @@ class Ortc {
       );
 
       rtpParameters.codecs.add(codec);
+      logger.debug('Added codec: ${codec.mimeType} (payloadType: ${codec.payloadType})');
 
-      // Add RTX codec.
+      // Add RTX codec if available.
       if (extendedCodec.localRtxPayloadType != null) {
         final rtxCodec = RtpCodecParameters(
           mimeType: '${kind.value}/rtx',
@@ -813,14 +881,55 @@ class Ortc {
         );
 
         rtpParameters.codecs.add(rtxCodec);
+        logger.debug('Added RTX codec for ${codec.mimeType} (payloadType: ${rtxCodec.payloadType})');
+      }
+    }
+
+    // Fallback: If no codecs were added, add defaults (proven fallback from Versatica patterns)
+    if (rtpParameters.codecs.isEmpty) {
+      logger.warn('No codecs found in extended capabilities - adding fallbacks for ${kind.value}');
+      if (kind == MediaKind.audio) {
+        // Default audio: Opus
+        rtpParameters.codecs.add(RtpCodecParameters(
+          mimeType: 'audio/opus',
+          payloadType: 111,
+          clockRate: 48000,
+          channels: 2,
+          parameters: {'minptime': 10, 'useinbandfec': 1},
+          rtcpFeedback: [],
+        ));
+        logger.debug('Added fallback audio codec: audio/opus');
+      } else if (kind == MediaKind.video) {
+        // Default video: H264 (with baseline profile for broad compatibility)
+        rtpParameters.codecs.add(RtpCodecParameters(
+          mimeType: 'video/H264',
+          payloadType: 96,
+          clockRate: 90000,
+          parameters: {'packetization-mode': 1, 'profile-level-id': '42e01f', 'level-asymmetry-allowed': 1},
+          rtcpFeedback: [
+            RtcpFeedback(type: 'nack'),
+            RtcpFeedback(type: 'nack', parameter: 'pli'),
+            RtcpFeedback(type: 'goog-remb'),
+          ],
+        ));
+        // Add RTX for video
+        rtpParameters.codecs.add(RtpCodecParameters(
+          mimeType: 'video/rtx',
+          payloadType: 97,
+          clockRate: 90000,
+          parameters: {'apt': 96},
+          rtcpFeedback: [],
+        ));
+        logger.debug('Added fallback video codec: video/H264 with RTX');
       }
     }
 
     for (ExtendedRtpHeaderExtension extendedExtension in extendedRtpCapabilities.headerExtensions) {
       // Ignore RTP extensions of a different kind and those not valid for sending.
-      if ((extendedExtension.kind != null && extendedExtension.kind != kind) ||
+      if ((extendedExtension.kind != null && extendedExtension.kind != TypeConversion.mediaKindToRtc(kind)) ||
           (extendedExtension.direction != RtpHeaderDirection.sendrecv &&
               extendedExtension.direction != RtpHeaderDirection.sendonly)) {
+        logger.debug('Skipping header extension: ${extendedExtension.uri} (mismatched kind/direction)');
         continue;
       }
 
@@ -832,6 +941,13 @@ class Ortc {
       );
 
       rtpParameters.headerExtensions.add(ext);
+      logger.debug('Added header extension: ${ext.uri} (id: ${ext.id})');
+    }
+
+    // Log final parameters
+    logger.debug('Final RTP parameters codecs count: ${rtpParameters.codecs.length}');
+    if (rtpParameters.codecs.isEmpty) {
+      logger.error('Failed to generate any codecs - this will cause downstream failures');
     }
 
     return rtpParameters;
@@ -839,20 +955,28 @@ class Ortc {
 
   /// Whether media can be sent based on the given RTP capabilities.
   static bool canSend(MediaKind kind, ExtendedRtpCapabilities extendedRtpCapabilities) {
-    return extendedRtpCapabilities.codecs.any((codec) => codec.kind == kind);
+    final logger = Logger('Ortc:canSend');
+    final rtcKind = TypeConversion.mediaKindToRtc(kind);
+    final canSendResult = extendedRtpCapabilities.codecs.any((codec) => codec.kind == rtcKind);
+    logger.debug('Can send ${kind.value}: $canSendResult (converted rtcKind: $rtcKind)');
+    return canSendResult;
   }
 
   /// Whether the given RTP parameters can be received with the given RTP
   /// capabilities.
   static bool canReceive(RtpParameters rtpParameters, ExtendedRtpCapabilities extendedRtpCapabilities) {
+    final logger = Logger('Ortc:canReceive');
     final validatedParams = validateRtpParameters(rtpParameters);
 
     if (validatedParams.codecs.isEmpty) {
+      logger.warn('No codecs in RTP parameters - cannot receive');
       return false;
     }
 
     final firstMediaCodec = validatedParams.codecs.first;
-    return extendedRtpCapabilities.codecs.any((codec) => codec.remotePayloadType == firstMediaCodec.payloadType);
+    final canReceiveResult = extendedRtpCapabilities.codecs.any((codec) => codec.remotePayloadType == firstMediaCodec.payloadType);
+    logger.debug('Can receive codec ${firstMediaCodec.mimeType}: $canReceiveResult');
+    return canReceiveResult;
   }
 }
 
